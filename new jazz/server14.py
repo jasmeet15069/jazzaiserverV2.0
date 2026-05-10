@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 # ─── stdlib ───────────────────────────────────────────────────────────────────
-import ast, asyncio, base64, csv, hashlib, hmac, html as html_lib, io, json, logging, math, os, platform, socket
+import ast, asyncio, base64, csv, hashlib, hmac, html as html_lib, io, json, logging, math, mimetypes, os, platform, socket
 import smtplib, ssl
 import re, secrets, shlex, shutil, subprocess, sys, tempfile, time, traceback, uuid
 import urllib.parse, urllib.request, urllib.error
@@ -3297,6 +3297,49 @@ def _extract_text_sync(path: Path, mime: str = "") -> Tuple[str, int]:
     except Exception as e:
         logger.warning("[RAG] extract_text: %s", e); return "", 0
 
+_STORED_UPLOAD_RE = re.compile(r"Stored upload:\s*([A-Za-z0-9][A-Za-z0-9._-]{0,240})", re.I)
+
+def _stored_upload_context_sync(message: str, max_chars: int = 140_000) -> str:
+    """Expand chat upload previews back into usable server-side text context."""
+    names = []
+    for match in _STORED_UPLOAD_RE.finditer(message or ""):
+        name = Path(match.group(1)).name
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return ""
+
+    upload_root = UPLOADS_DIR.resolve()
+    sections: List[str] = []
+    remaining = max_chars
+    for name in names[:6]:
+        if remaining <= 0:
+            break
+        path = (UPLOADS_DIR / name).resolve()
+        if upload_root not in path.parents or not path.exists() or not path.is_file():
+            continue
+        text, _ = _extract_text_sync(path, mimetypes.guess_type(path.name)[0] or "")
+        text = (text or "").strip()
+        if not text:
+            continue
+        excerpt = text[:remaining]
+        sections.append(f"File: {name}\n{text[:remaining]}")
+        remaining -= len(excerpt)
+    if not sections:
+        return ""
+    return (
+        "[Full attached/pasted file context]\n"
+        "The user attached or pasted this content in the current message. "
+        "Use it for coding, debugging, analysis, and file generation tasks.\n\n"
+        + "\n\n---\n\n".join(sections)
+    )
+
+async def _stored_upload_context(message: str, max_chars: int = 140_000) -> str:
+    if "Stored upload:" not in (message or ""):
+        return ""
+    return await asyncio.get_running_loop().run_in_executor(
+        _executor, _stored_upload_context_sync, message, max_chars)
+
 async def _index_document(doc_id: str, user_id: str, path: Path, collection: str = "documents"):
     col = _get_collection(user_id, collection)
     text, pages = await asyncio.get_running_loop().run_in_executor(
@@ -3720,8 +3763,52 @@ _PRIVATE_FACT_PATTERNS: Tuple[Tuple[re.Pattern, str], ...] = (
     (re.compile(r"\b(?:private|personal)\s+(?:file|document|folder|data)\b", re.I), "private file or document"),
 )
 
+_ATTACHED_OR_PASTED_MARKERS = (
+    "<jazz_pasted_content",
+    "[attached files]",
+    "stored upload:",
+    "extracted preview:",
+    "audio transcript:",
+    "pasted content",
+)
+
+_CODE_CONTEXT_RE = re.compile(
+    r"```|"
+    r"\b(?:fix|debug|compile|refactor|implement|code|coding|function|class|"
+    r"component|endpoint|route|api|typescript|javascript|python|react|nextjs|"
+    r"html|css|sql|stacktrace|traceback|syntaxerror|typeerror|referenceerror)\b|"
+    r"\b(?:def|class|import|from|const|let|var|function|export|return|async|await)\b|"
+    r"[{};]{6,}|</?[a-z][^>]{0,80}>",
+    re.I,
+)
+
+def _has_attached_or_pasted_context(text: str) -> bool:
+    low = (text or "").lower()
+    return any(marker in low for marker in _ATTACHED_OR_PASTED_MARKERS)
+
+def _looks_like_code_or_dev_context(text: str) -> bool:
+    raw = text or ""
+    if not raw:
+        return False
+    if _CODE_CONTEXT_RE.search(raw):
+        return True
+    lines = raw.splitlines()
+    if len(lines) >= 12:
+        codeish = sum(
+            1 for line in lines[:300]
+            if re.search(r"[{};]|^\s*(?:def|class|import|from|const|let|var|function|return|if|for|while)\b", line)
+        )
+        if codeish >= 5:
+            return True
+    return False
+
 def _is_personal_fact_lookup(text: str) -> bool:
-    t = re.sub(r"\s+", " ", (text or "").strip().lower())
+    raw = text or ""
+    if _has_attached_or_pasted_context(raw) or _looks_like_code_or_dev_context(raw):
+        return False
+    if len(raw) > 2500:
+        return False
+    t = re.sub(r"\s+", " ", raw.strip().lower())
     if not t or "my" not in t:
         return False
     lookup_verbs = (
@@ -3871,11 +3958,16 @@ async def _build_context(session_id: str, user_id: str, new_msg: str,
     msgs = [{"role":"system","content":system_content}]
     budget -= _count_tokens(system_content)
 
-    safe_new_msg = new_msg
+    effective_new_msg = new_msg
+    expanded_upload_context = await _stored_upload_context(new_msg or "")
+    if expanded_upload_context:
+        effective_new_msg = f"{new_msg}\n\n{expanded_upload_context}".strip()
+
+    safe_new_msg = effective_new_msg
     new_msg_compacted = False
-    if new_msg:
+    if effective_new_msg:
         user_budget = max(256, int(max(512, budget) * 0.78))
-        safe_new_msg, new_msg_compacted = _fit_text_to_token_budget(new_msg, user_budget)
+        safe_new_msg, new_msg_compacted = _fit_text_to_token_budget(effective_new_msg, user_budget)
         if new_msg_compacted:
             notice = (
                 "\n\n[Long input handling]\nThe current user message was automatically "
