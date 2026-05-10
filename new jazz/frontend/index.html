@@ -2696,6 +2696,7 @@ async function _sendChatInternal(msg, attachments = []) {
   let liveToolEvents = [];
   let mode = 'normal';
   let suppressLiveAssistant = isToolSlashMessage(msg);
+  let generatedFileQueued = false;
 
   function _onDone(d) {
     requestCompleted = true;
@@ -2740,6 +2741,10 @@ async function _sendChatInternal(msg, attachments = []) {
     addCopyBtns(); hljs.highlightAll(); scrollBottom();
     updateTokenBar({ input:d.tokens?.input||0, output:d.tokens?.output||0, context:d.context });
     if (!d.context) setTimeout(loadContextStatus, 300);
+    if (!generatedFileQueued) {
+      generatedFileQueued = true;
+      maybeGenerateFileFromResponse(apiMsg, displayText || full);
+    }
     loadSessions(); loadUsage(); renderQueuePanel(); _tryRunNextQueued();
   }
   function _onDelta(content) {
@@ -2945,8 +2950,188 @@ function updateFilesBadge() {
   });
   ['files-header-btn'].forEach(id => document.getElementById(id)?.classList.toggle('active', !!S.filesPanelOpen));
 }
+function fileRecordKey(file = {}) {
+  return [
+    file.stored || file.filename || '',
+    file.name || file.original || '',
+    file.type || '',
+    file.size || 0
+  ].join('|').toLowerCase();
+}
+function dedupeFileRecords(files = []) {
+  const seen = new Set(), out = [];
+  for (const raw of files || []) {
+    if (!raw) continue;
+    const f = { ...raw };
+    f.key = f.key || fileRecordKey(f);
+    if (seen.has(f.key)) continue;
+    seen.add(f.key);
+    out.push(f);
+  }
+  return out;
+}
+const CODE_EXT_PATTERN = 'py|js|mjs|cjs|ts|tsx|jsx|css|scss|html|json|md|txt|java|kt|kts|c|cpp|h|hpp|cs|go|rs|php|rb|swift|sh|bash|ps1|sql|xml|yml|yaml|toml|ini|env';
+const CODE_LANG_EXT = {
+  python:'py', py:'py', javascript:'js', js:'js', node:'js', mjs:'mjs', cjs:'cjs',
+  typescript:'ts', ts:'ts', tsx:'tsx', jsx:'jsx', react:'tsx', nextjs:'tsx', 'next.js':'tsx',
+  html:'html', css:'css', scss:'scss', json:'json', markdown:'md', md:'md', text:'txt',
+  java:'java', kotlin:'kt', kt:'kt', kts:'kts', c:'c', cpp:'cpp', 'c++':'cpp', h:'h', hpp:'hpp',
+  csharp:'cs', 'c#':'cs', cs:'cs', go:'go', golang:'go', rust:'rs', rs:'rs', php:'php',
+  ruby:'rb', rb:'rb', swift:'swift', shell:'sh', bash:'sh', sh:'sh', powershell:'ps1', ps1:'ps1',
+  sql:'sql', xml:'xml', yaml:'yaml', yml:'yml', toml:'toml', ini:'ini', env:'env', dockerfile:'dockerfile'
+};
+const CODE_DEFAULT_NAMES = {
+  py:'app.py', js:'script.js', mjs:'index.mjs', cjs:'index.cjs', ts:'index.ts', tsx:'App.tsx', jsx:'App.jsx',
+  css:'styles.css', scss:'styles.scss', html:'index.html', json:'data.json', md:'README.md', txt:'notes.txt',
+  java:'Main.java', kt:'Main.kt', kts:'script.kts', c:'main.c', cpp:'main.cpp', h:'main.h', hpp:'main.hpp',
+  cs:'Program.cs', go:'main.go', rs:'main.rs', php:'index.php', rb:'app.rb', swift:'main.swift',
+  sh:'script.sh', ps1:'script.ps1', sql:'query.sql', xml:'document.xml', yml:'config.yml',
+  yaml:'config.yaml', toml:'config.toml', ini:'config.ini', env:'.env', dockerfile:'Dockerfile'
+};
+function detectGeneratedFileRequest(text = '') {
+  const raw = String(text || '').trim();
+  const s = raw.toLowerCase();
+  if (!/\b(generate|create|make|export|download|save|build|prepare|convert|compile|render)\b/.test(s)) return null;
+  if (!/\b(file|pdf|excel|xlsx|spreadsheet|csv|text|txt|markdown|md|word|docx|powerpoint|pptx|ppt|slides|html|webpage|json|zip|archive|document|report)\b/.test(s)) return null;
+  let fileType = 'txt';
+  if (/\b(powerpoint|pptx|ppt|slides|presentation|deck)\b/.test(s)) fileType = 'pptx';
+  else if (/\b(word|docx|doc)\b/.test(s)) fileType = 'docx';
+  else if (/\b(excel|xlsx|spreadsheet|workbook)\b/.test(s)) fileType = 'xlsx';
+  else if (/\bcsv\b/.test(s)) fileType = 'csv';
+  else if (/\b(html|webpage|web page)\b/.test(s)) fileType = 'html';
+  else if (/\bjson\b/.test(s)) fileType = 'json';
+  else if (/\b(zip|archive)\b/.test(s)) fileType = 'zip';
+  else if (/\b(markdown|md)\b/.test(s)) fileType = 'md';
+  else if (/\b(pdf|report|document)\b/.test(s)) fileType = 'pdf';
+  const nameMatch = raw.match(/(?:called|named|filename|file name|as)\s+["'`]?([A-Za-z0-9][A-Za-z0-9._ -]{0,80}?\.(?:pdf|xlsx|csv|txt|md|docx|pptx|html|json|zip))/i);
+  return { file_type: fileType, filename: nameMatch?.[1]?.trim() || '' };
+}
+function isCodingArtifactRequest(text = '') {
+  const s = String(text || '').toLowerCase();
+  if (/<jazz_pasted_content\b/.test(s)) return true;
+  return /\b(code|coding|script|program|app|component|api|endpoint|route|function|class|bug|debug|fix|implement|build|create|make|generate|refactor|python|javascript|typescript|react|next\.?js|node|express|fastapi|html|css|sql|dockerfile|project)\b/.test(s);
+}
+function codeExtFromLang(lang = '', fallback = 'txt') {
+  const raw = String(lang || '').trim().toLowerCase().replace(/^language-/, '').split(/\s+/)[0];
+  return CODE_LANG_EXT[raw] || fallback || 'txt';
+}
+function extFromFilename(name = '') {
+  const clean = String(name || '').trim();
+  if (/^dockerfile$/i.test(clean)) return 'dockerfile';
+  const m = clean.match(new RegExp('\\.(' + CODE_EXT_PATTERN + ')$', 'i'));
+  return m ? codeExtFromLang(m[1], m[1].toLowerCase()) : '';
+}
+function cleanCodeFilename(name = '', ext = 'txt', index = 1) {
+  let base = String(name || '').trim().replace(/[`"'<>]/g, '').replace(/[\\/:]+/g, '_').replace(/\s+/g, '_').replace(/[^A-Za-z0-9._ -]/g, '_').replace(/^[._ -]+|[._ -]+$/g, '').slice(0, 90);
+  const finalExt = ext || extFromFilename(base) || 'txt';
+  if (!base || /^file$/i.test(base)) base = CODE_DEFAULT_NAMES[finalExt] || `code_${index}.${finalExt}`;
+  if (finalExt === 'dockerfile') return /^dockerfile$/i.test(base) ? 'Dockerfile' : `Dockerfile_${index}`;
+  if (!base.toLowerCase().endsWith('.' + finalExt)) base = base.replace(/\.[A-Za-z0-9]{1,8}$/i, '') + '.' + finalExt;
+  return base;
+}
+function inferCodeFilename(lang, info, code, userPrompt, before, index) {
+  const extRx = CODE_EXT_PATTERN;
+  const infoText = String(info || '');
+  const explicit = infoText.match(new RegExp("(?:file(?:name)?|path)\\s*=\\s*[\"']?([A-Za-z0-9._/\\\\ -]+\\.(?:" + extRx + ")|Dockerfile)", 'i'))
+    || infoText.match(new RegExp('(?:^|\\s)([A-Za-z0-9._/\\\\ -]+\\.(?:' + extRx + ')|Dockerfile)(?:\\s|$)', 'i'))
+    || String(before || '').match(new RegExp('(?:File|Path|Filename)\\s*:\\s*`?([A-Za-z0-9._/\\\\ -]+\\.(?:' + extRx + ')|Dockerfile)`?\\s*$', 'i'))
+    || String(before || '').match(new RegExp('(?:^|\\n)\\s*(?:#{1,6}\\s*)?`?([A-Za-z0-9._/\\\\ -]+\\.(?:' + extRx + ')|Dockerfile)`?\\s*:?\\s*$', 'i'))
+    || String(userPrompt || '').match(new RegExp("(?:called|named|filename|file name|save as|as)\\s+[\"'`]?([A-Za-z0-9._/\\\\ -]+\\.(?:" + extRx + ")|Dockerfile)", 'i'));
+  const explicitName = explicit?.[1]?.trim() || '';
+  const explicitExt = extFromFilename(explicitName);
+  let ext = explicitExt || codeExtFromLang(lang, '');
+  if (!ext) {
+    if (/^\s*<!doctype html|^\s*<html[\s>]/i.test(code)) ext = 'html';
+    else if (/^\s*[{[]/.test(code) && /[}\]]\s*$/.test(code)) ext = 'json';
+    else if (/^\s*import\s+React|from\s+['"]react['"]|export\s+default\s+function\s+[A-Z]/m.test(code)) ext = 'tsx';
+    else if (/^\s*(from\s+\w+\s+import|import\s+\w+|def\s+\w+\(|class\s+\w+)/m.test(code)) ext = 'py';
+    else if (/^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER)\b/im.test(code)) ext = 'sql';
+    else ext = 'txt';
+  }
+  const fallback = CODE_DEFAULT_NAMES[ext] || `code_${index}.${ext}`;
+  return { filename: cleanCodeFilename(explicitName || fallback, ext, index), ext };
+}
+function extractCodeArtifactsFromResponse(userPrompt, assistantText) {
+  const text = String(assistantText || '');
+  const artifacts = [], rx = /```([^\n`]*)\n([\s\S]*?)```/g;
+  let match;
+  while ((match = rx.exec(text)) && artifacts.length < 8) {
+    const info = (match[1] || '').trim();
+    const code = String(match[2] || '').replace(/\s+$/, '');
+    if (code.length < 30 || !/\n/.test(code)) continue;
+    const before = text.slice(Math.max(0, match.index - 260), match.index);
+    const lang = info.split(/\s+/)[0] || '';
+    artifacts.push({ ...inferCodeFilename(lang, info, code, userPrompt, before, artifacts.length + 1), content: code });
+  }
+  const used = new Set();
+  return artifacts.map((a, idx) => {
+    let name = a.filename;
+    if (used.has(name.toLowerCase())) name = cleanCodeFilename(name.replace(/(\.[^.]+)$/, `_${idx + 1}$1`), a.ext, idx + 1);
+    used.add(name.toLowerCase());
+    return { ...a, filename: name };
+  });
+}
+async function maybeGenerateFileFromResponse(userPrompt, assistantText) {
+  const content = String(assistantText || '').trim();
+  try {
+    if (isCodingArtifactRequest(userPrompt)) {
+      const artifacts = extractCodeArtifactsFromResponse(userPrompt, content);
+      if (artifacts.length) {
+        const saved = [];
+        for (const artifact of artifacts) {
+          const result = await post('/files/generate', {
+            prompt: userPrompt,
+            content: artifact.content,
+            file_type: artifact.ext,
+            filename: artifact.filename,
+            raw_code: true
+          });
+          saved.push({ ...result, generated:true });
+        }
+        addFilesToLibrary(saved);
+        toast(`Generated ${saved.length} code file${saved.length === 1 ? '' : 's'}`, 'ok');
+        if (!S.filesPanelOpen) openFilesPanel();
+        return;
+      }
+    }
+    const intent = detectGeneratedFileRequest(userPrompt);
+    if (!intent || !content || content.startsWith('[')) return;
+    const result = await post('/files/generate', {
+      prompt: userPrompt,
+      content,
+      file_type: intent.file_type,
+      filename: intent.filename || undefined
+    });
+    addFilesToLibrary([{ ...result, generated:true }]);
+    toast(`Generated ${result.original || 'file'}`, 'ok');
+    if (!S.filesPanelOpen) openFilesPanel();
+  } catch(e) {
+    toast(`File generation failed: ${e.message || 'could not create file'}`, 'err');
+  }
+}
 function addFilesToLibrary(files = []) {
   const records = (files || []).map(att => {
+    if (att.generated || att.download_url || att.downloadUrl) {
+      const stored = att.filename || att.stored || '';
+      const name = att.original || att.name || stored || 'generated-file';
+      return {
+        id: att.id || 'file_' + Date.now() + '_' + Math.random().toString(36).slice(2),
+        name,
+        type: att.type || att.mime || 'application/octet-stream',
+        size: att.size || 0,
+        stored,
+        generated: !!att.generated,
+        compiled: typeof att.compiled === 'boolean' ? att.compiled : null,
+        engine: att.engine || '',
+        analysis: att.analysis || null,
+        downloadUrl: att.download_url || att.downloadUrl || (stored ? `/files/download/${encodeURIComponent(stored)}` : ''),
+        preview: String(att.text_preview || att.preview || '').slice(0, 2400),
+        transcript: '',
+        imageData: '',
+        sessionId: S.activeSession || '',
+        createdAt: Date.now()
+      };
+    }
     const up = att.uploaded || {};
     const transcript = String(att.transcript?.transcript || '').trim();
     const preview = String(up.text_preview || '').trim();
@@ -2965,7 +3150,7 @@ function addFilesToLibrary(files = []) {
     };
   });
   if (!records.length) return;
-  S.fileLibrary = [...records, ...(S.fileLibrary || [])].slice(0, 80);
+  S.fileLibrary = dedupeFileRecords([...records, ...(S.fileLibrary || [])]).slice(0, 80);
   saveFileLibrary();
   updateFilesBadge();
   if (S.filesPanelOpen) renderFilesPanel();
@@ -2973,7 +3158,9 @@ function addFilesToLibrary(files = []) {
 function fileRowHtml(file, pending = false) {
   const image = file.previewUrl || file.imageData || '';
   const thumb = image ? `<img src="${escAttr(image)}" alt="">` : `<span class="file-ext">${escHtml(attachmentExt(file.name, file.type))}</span>`;
-  const sub = `${fmtFileSize(file.size)} / ${file.type || 'file'}${pending ? ' / pending' : file.stored ? ' / uploaded' : ''}`;
+  const status = pending ? 'pending' : file.compiled === true ? 'compiled' : file.compiled === false ? 'interpreted PDF' : file.generated ? 'generated' : file.stored ? 'uploaded' : '';
+  const engine = file.engine && file.engine !== 'none' ? ` / ${file.engine}` : '';
+  const sub = `${fmtFileSize(file.size)} / ${file.type || 'file'}${status ? ' / ' + status : ''}${engine}`;
   return `<div class="file-row ${pending?'pending':''}">
     <div class="file-tilt">${thumb}</div>
     <div style="min-width:0">
@@ -2987,7 +3174,8 @@ function renderFilesPanel() {
   const panel = document.getElementById('files-side-panel');
   if (!panel) return;
   const pending = (S.pendingAttachments || []).map(f => ({ ...f, pending:true }));
-  const files = [...pending, ...(S.fileLibrary || [])];
+  S.fileLibrary = dedupeFileRecords(S.fileLibrary || []).slice(0, 80);
+  const files = dedupeFileRecords([...pending, ...(S.fileLibrary || [])]);
   const content = files.filter(f => f.previewUrl || f.imageData || f.preview || f.transcript).slice(0, 8);
   panel.innerHTML = `
     <div class="files-panel-head">
@@ -3033,6 +3221,10 @@ function clearFileLibrary() {
 function downloadFileRecord(id) {
   const file = [...(S.pendingAttachments || []), ...(S.fileLibrary || [])].find(f => f.id === id);
   if (!file) return;
+  if (file.downloadUrl || file.stored) {
+    downloadServerFile(file);
+    return;
+  }
   const href = file.previewUrl || file.imageData || '';
   const a = document.createElement('a');
   a.download = file.name || 'jazz-file';
@@ -3048,6 +3240,21 @@ function downloadFileRecord(id) {
   a.click();
   a.remove();
   if (a.href.startsWith('blob:') && !file.previewUrl) setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+async function downloadServerFile(file) {
+  try {
+    const url = file.downloadUrl || `/files/download/${encodeURIComponent(file.stored)}`;
+    const r = await apiFetch(API + url, { headers:{ Authorization:'Bearer '+S.token } });
+    if (!r.ok) throw new Error('Download failed');
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = file.name || 'jazz-file';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch(e) { toast(e.message || 'Download failed', 'err'); }
 }
 let _accountOutsideHandler = null;
 function accountInitial() { return (S.user?.full_name || S.user?.email || 'J')[0].toUpperCase(); }

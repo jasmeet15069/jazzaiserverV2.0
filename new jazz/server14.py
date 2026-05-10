@@ -2307,9 +2307,18 @@ async def _auto_route_model(preferred_model_id: str, message: str,
     estimated = _count_tokens(message or "")
     preferred_budget = await _context_input_budget(preferred)
     code_like = _has_attached_or_pasted_context(message or "") or _looks_like_code_or_dev_context(message or "")
-    if code_like and estimated > 3000:
+    preferred_row = await db_fetchone(
+        "SELECT * FROM ai_models WHERE (id=? OR name=? OR model_name=?) AND is_active=1 LIMIT 1",
+        (preferred, preferred, preferred))
+    preferred_provider = str((preferred_row or {}).get("provider") or (BUILTIN_MODELS.get(preferred) or {}).get("provider") or "").lower()
+    preferred_is_code = bool(int((preferred_row or {}).get("is_code") or 0))
+    weak_code_model = preferred in {LOCAL_JAZZ_MODEL_ID, "jazz-ai-testing", "llama-3.1-8b-instant"} or preferred_provider == "local_generate"
+    needs_code_route = code_like and (estimated > 3000 or weak_code_model)
+    if code_like and preferred_is_code and preferred_provider != "local_generate" and estimated <= int(preferred_budget * 0.82):
+        needs_code_route = False
+    if needs_code_route:
         db_rows = await db_fetchall(
-            "SELECT id,provider,is_fast,is_code,context_length FROM ai_models "
+            "SELECT id,name,provider,model_name,description,is_fast,is_code,context_length FROM ai_models "
             "WHERE is_active=1 AND is_code=1")
         row_map = {_canonical_model_id(r["id"]): r for r in db_rows}
         candidates: List[str] = []
@@ -2342,9 +2351,22 @@ async def _auto_route_model(preferred_model_id: str, message: str,
                 if context_budget <= estimated + 1024:
                     continue
                 budget_score = min(int(row.get("context_length") or context_budget), 200000)
-            # Prefer fast working code models for pasted notebooks. NVIDIA Kimi stays as
-            # a large-context fallback, but it is too slow for routine code review.
-            provider_rank = 3 if provider == "groq" else 2 if provider in ("openai", "local_generate") else 1
+            hay = " ".join(str(row.get(k, "")) for k in ("id", "name", "model_name", "description")).lower()
+            # Prefer smarter code models for coding work; keep tiny local models as a last resort.
+            if "glm-5" in hay or "qwen3-coder" in hay or "coder" in hay:
+                provider_rank = 7
+            elif provider == "openai":
+                provider_rank = 6
+            elif provider == "nvidia":
+                provider_rank = 5
+            elif provider == "huggingface":
+                provider_rank = 4
+            elif provider == "groq":
+                provider_rank = 3
+            elif provider == "local_generate":
+                provider_rank = 1
+            else:
+                provider_rank = 2
             fast_rank = 1 if int(row.get("is_fast") or 0) else 0
             scored.append((provider_rank, fast_rank, budget_score, mid))
         if scored:
@@ -3282,6 +3304,10 @@ async def _model_request_input_budget(model_id: str) -> int:
         provider = str((row or {}).get("provider") or "").lower()
     if provider == "groq":
         default_cap = min(default_cap, int(os.getenv("GROQ_REQUEST_INPUT_TOKENS") or "4200"))
+    elif provider in ("huggingface", "nvidia", "openai"):
+        model_limit = await _model_context_limit(mid)
+        if model_limit >= 50000:
+            default_cap = max(default_cap, int(os.getenv("MODEL_LARGE_CONTEXT_INPUT_TOKENS") or "60000"))
     if mid == "llama-3.1-8b-instant":
         default_cap = min(default_cap, 4200)
     elif mid == "llama-3.3-70b-versatile":
@@ -3682,12 +3708,16 @@ CAPABILITIES:
 • Execute code, run shell commands, search documents via RAG
 • Memory of user preferences and past context
 • Deep reasoning mode for complex questions
+• Claude-style coding help: produce complete, runnable code and downloadable file artifacts
 
 RESPONSE GUIDELINES:
 • Be direct, precise, and genuinely helpful
 • Use markdown for structure (tables, code blocks, lists)
 • For connector results, present data in clean tables or structured lists
-• For code, always include the language tag in code blocks"""
+• For code, always include the language tag in code blocks
+• For coding/build/debug requests, act like a senior engineer: identify the root cause, give the exact fix, and include complete code that can run.
+• For multi-file code, include a compact file tree and label each code block with its filename, for example `File: app.py` before a fenced code block.
+• When the user asks to create, generate, build, save, or make code, provide the actual file contents instead of only instructions."""
 
 _ANTI_HALLUCINATION_PROMPT = """[Evidence and anti-hallucination rules]
 - Do not invent facts, names, files, document contents, web sources, tool results, prices, dates, or citations.
@@ -7311,9 +7341,10 @@ class FileGenerateReq(BaseModel):
     content: str = Field(..., min_length=1, max_length=1_000_000)
     file_type: str = Field(
         "txt",
-        pattern="^(txt|text|md|markdown|csv|xlsx|excel|pdf|tex|latex|docx|word|pptx|ppt|powerpoint|slides|presentation|html|json|zip|archive)$",
+        pattern="^(txt|text|md|markdown|csv|xlsx|excel|pdf|tex|latex|docx|word|pptx|ppt|powerpoint|slides|presentation|html|json|zip|archive|code|py|js|mjs|cjs|ts|tsx|jsx|css|scss|java|kt|kts|c|cpp|h|hpp|cs|go|rs|php|rb|swift|sh|bash|ps1|sql|xml|yml|yaml|toml|ini|env|dockerfile)$",
     )
     filename: Optional[str] = Field(None, max_length=120)
+    raw_code: bool = False
 
 class LatexCompileReq(BaseModel):
     source: str = Field(..., min_length=1, max_length=1_000_000)
@@ -11917,6 +11948,8 @@ async def upload_file_generic(file: UploadFile = File(...), user: Dict = Depends
 def _safe_generated_filename(name: str, ext: str) -> str:
     base = re.sub(r"[^A-Za-z0-9._ -]+", "_", name or "jazz-generated").strip(" ._-")
     base = re.sub(r"\s+", "_", base)[:80] or "jazz-generated"
+    if ext == "dockerfile" and base.lower() == "dockerfile":
+        return "Dockerfile"
     if not base.lower().endswith("." + ext):
         base = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", base) + "." + ext
     return base
@@ -11933,6 +11966,17 @@ _GENERATED_EXT_ALIASES = {
     "html": "html",
     "json": "json",
     "zip": "zip", "archive": "zip",
+    "code": "txt",
+    "py": "py",
+    "js": "js", "mjs": "mjs", "cjs": "cjs",
+    "ts": "ts", "tsx": "tsx", "jsx": "jsx",
+    "css": "css", "scss": "scss",
+    "java": "java", "kt": "kt", "kts": "kts",
+    "c": "c", "cpp": "cpp", "h": "h", "hpp": "hpp", "cs": "cs",
+    "go": "go", "rs": "rs", "php": "php", "rb": "rb", "swift": "swift",
+    "sh": "sh", "bash": "sh", "ps1": "ps1",
+    "sql": "sql", "xml": "xml", "yml": "yml", "yaml": "yaml",
+    "toml": "toml", "ini": "ini", "env": "env", "dockerfile": "dockerfile",
 }
 
 _GENERATED_MIME = {
@@ -11947,14 +11991,64 @@ _GENERATED_MIME = {
     "html": "text/html",
     "json": "application/json",
     "zip": "application/zip",
+    "py": "text/x-python",
+    "js": "text/javascript",
+    "mjs": "text/javascript",
+    "cjs": "text/javascript",
+    "ts": "text/typescript",
+    "tsx": "text/tsx",
+    "jsx": "text/jsx",
+    "css": "text/css",
+    "scss": "text/x-scss",
+    "java": "text/x-java-source",
+    "kt": "text/plain",
+    "kts": "text/plain",
+    "c": "text/x-c",
+    "cpp": "text/x-c++src",
+    "h": "text/x-c",
+    "hpp": "text/x-c++hdr",
+    "cs": "text/x-csharp",
+    "go": "text/x-go",
+    "rs": "text/rust",
+    "php": "application/x-httpd-php",
+    "rb": "text/x-ruby",
+    "swift": "text/x-swift",
+    "sh": "application/x-sh",
+    "ps1": "text/plain",
+    "sql": "application/sql",
+    "xml": "application/xml",
+    "yml": "application/x-yaml",
+    "yaml": "application/x-yaml",
+    "toml": "application/toml",
+    "ini": "text/plain",
+    "env": "text/plain",
+    "dockerfile": "text/x-dockerfile",
+}
+
+_GENERATED_CODE_EXTS = {
+    "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "css", "scss", "java", "kt", "kts",
+    "c", "cpp", "h", "hpp", "cs", "go", "rs", "php", "rb", "swift", "sh", "ps1",
+    "sql", "xml", "yml", "yaml", "toml", "ini", "env", "dockerfile",
 }
 
 def _generated_ext(kind: str) -> str:
     return _GENERATED_EXT_ALIASES.get((kind or "txt").lower(), "txt")
 
+def _filename_generated_ext(filename: str) -> Optional[str]:
+    name = Path(filename or "").name.strip()
+    if not name:
+        return None
+    if name.lower() == "dockerfile":
+        return "dockerfile"
+    suffix = Path(name).suffix.lower().lstrip(".")
+    if not suffix:
+        return None
+    ext = _GENERATED_EXT_ALIASES.get(suffix)
+    return ext if ext in _GENERATED_MIME else None
+
 def _infer_generated_filename(prompt: str, content: str, ext: str) -> str:
     text = f"{prompt}\n{content[:500]}"
-    m = re.search(r"(?:called|named|filename|file name|as)\s+[`\"']?([A-Za-z0-9][A-Za-z0-9._ -]{0,80}?\.(?:pdf|tex|latex|xlsx|csv|txt|md|markdown|docx|pptx|html|json|zip))", text, re.I)
+    m = re.search(r"(?:called|named|filename|file name|as)\s+[`\"']?([A-Za-z0-9][A-Za-z0-9._ -]{0,80}?\.(?:pdf|tex|latex|xlsx|csv|txt|md|markdown|docx|pptx|html|json|zip|py|js|mjs|cjs|ts|tsx|jsx|css|scss|java|kt|kts|c|cpp|h|hpp|cs|go|rs|php|rb|swift|sh|bash|ps1|sql|xml|yml|yaml|toml|ini|env))", text, re.I)
     if not m:
         m = re.search(
             r"(?:called|named|filename|file name|as)\s+[`\"']?([A-Za-z0-9][A-Za-z0-9._ -]{1,80}?)(?=$|[`\"',.!?:;]|\s+(?:with|for|from|about|containing|using|and)\b)",
@@ -12369,7 +12463,8 @@ def _write_generated_pdf(path: Path, title: str, content: str) -> None:
     path.write_bytes(out.getvalue())
 
 def _build_generated_file(req: FileGenerateReq, user_id: str) -> Dict[str, Any]:
-    ext = _generated_ext(req.file_type)
+    ext = _filename_generated_ext(req.filename or "") if req.raw_code else None
+    ext = ext or _generated_ext(req.file_type)
     mime = _GENERATED_MIME[ext]
     original = _infer_generated_filename(req.prompt, req.content, ext) if not req.filename else _safe_generated_filename(req.filename, ext)
     stored = f"{_new_id()}_{original}"
@@ -12377,7 +12472,11 @@ def _build_generated_file(req: FileGenerateReq, user_id: str) -> Dict[str, Any]:
     title = Path(original).stem.replace("_", " ").strip() or "JAZZ Generated File"
     clean_content = _clean_generated_content(req.content)
     extra: Dict[str, Any] = {}
-    if ext == "txt":
+    if req.raw_code:
+        path.write_text(clean_content, encoding="utf-8")
+    elif ext in _GENERATED_CODE_EXTS:
+        path.write_text(clean_content, encoding="utf-8")
+    elif ext == "txt":
         path.write_text(clean_content, encoding="utf-8")
     elif ext == "md":
         path.write_text(clean_content, encoding="utf-8")
