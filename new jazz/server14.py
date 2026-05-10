@@ -360,6 +360,7 @@ _executor = ThreadPoolExecutor(max_workers=16)
 GROQ_MODELS = {
     "llama-3.3-70b-versatile": {"label":"Llama 3.3 70B","ctx":32768,"fast":False,"provider":"groq","censored":True},
     "llama-3.1-8b-instant":    {"label":"Llama 3.1 8B (Fast)","ctx":131072,"fast":True,"provider":"groq","censored":True},
+    "qwen/qwen3-32b":           {"label":"Qwen3 32B (Groq)","ctx":131072,"fast":True,"provider":"groq","censored":True},
 }
 
 HUGGINGFACE_MODELS = {
@@ -2085,6 +2086,8 @@ async def _get_model_client(model_id: str) -> Tuple[OpenAI, str]:
         base_url = row["base_url"] or _PROVIDER_DEFAULTS.get(row["provider"], "")
         if row["provider"] == "huggingface" and not api_key:
             api_key = (_hf_api_keys("") or [""])[0]
+        if row["provider"] == "groq" and not api_key:
+            api_key = GROQ_API_KEY
         if row["provider"] == "nvidia" and not api_key:
             api_key = NVIDIA_API_KEY
         if row["provider"] == "nvidia":
@@ -2653,7 +2656,7 @@ async def _llm_text_once(messages: List[Dict], model_id: str,
             if kind == "delta":
                 chunks.append(payload)
                 provider_model = meta.get("provider_model") or provider_model
-        return "".join(chunks), _canonical_model_id(model_id), provider_model
+        return _strip_model_thinking_markup("".join(chunks)), _canonical_model_id(model_id), provider_model
     mid = _canonical_model_id(model_id)
     hf_row = await db_fetchone(
         "SELECT * FROM ai_models WHERE (id=? OR name=? OR model_name=?) AND is_active=1 LIMIT 1",
@@ -2680,7 +2683,7 @@ async def _llm_text_once(messages: List[Dict], model_id: str,
                     lambda c=client, m=hf_row["model_name"], e=extra_body: c.chat.completions.create(
                         model=m, messages=messages, max_tokens=max_tokens, temperature=temperature,
                         **({"extra_body": e} if e else {})))
-                return resp.choices[0].message.content or "", mid, hf_row["model_name"]
+                return _strip_model_thinking_markup(resp.choices[0].message.content or ""), mid, hf_row["model_name"]
             except Exception as exc:
                 last_error = exc
                 logger.warning("[LLM] HF completion token #%s failed for %s: %s", idx + 1, mid, exc)
@@ -2698,19 +2701,41 @@ async def _llm_text_once(messages: List[Dict], model_id: str,
                     _executor,
                     lambda c=client, m=meta["model_name"]: c.chat.completions.create(
                         model=m, messages=messages, max_tokens=max_tokens, temperature=temperature))
-                return resp.choices[0].message.content or "", mid, meta["model_name"]
+                return _strip_model_thinking_markup(resp.choices[0].message.content or ""), mid, meta["model_name"]
             except Exception as exc:
                 last_error = exc
                 logger.warning("[LLM] HF builtin completion token #%s failed for %s: %s", idx + 1, mid, exc)
         raise last_error or RuntimeError("No Hugging Face tokens available")
     client, model_name = await _get_model_client(model_id)
     extra_body = await _chat_completion_extra_body(model_id)
+    provider_messages = _messages_for_provider_model(messages, model_name)
     resp = await asyncio.get_running_loop().run_in_executor(
         _executor,
         lambda c=client, m=model_name, e=extra_body: c.chat.completions.create(
-            model=m, messages=messages, max_tokens=max_tokens, temperature=temperature,
+            model=m, messages=provider_messages, max_tokens=max_tokens, temperature=temperature,
             **({"extra_body": e} if e else {})))
-    return resp.choices[0].message.content or "", _canonical_model_id(model_id), model_name
+    return _strip_model_thinking_markup(resp.choices[0].message.content or ""), _canonical_model_id(model_id), model_name
+
+def _messages_for_provider_model(messages: List[Dict], provider_model: str) -> List[Dict]:
+    """Provider-specific prompt nudge for models that otherwise emit hidden thinking."""
+    model = str(provider_model or "").lower()
+    if "qwen/qwen3" not in model:
+        return messages
+    out = [dict(m) for m in messages]
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") != "user":
+            continue
+        content = out[i].get("content")
+        if isinstance(content, str) and "/no_think" not in content.lower():
+            out[i]["content"] = "/no_think " + content
+            break
+    return out
+
+def _strip_model_thinking_markup(text: str) -> str:
+    clean = str(text or "")
+    clean = re.sub(r"(?is)<think>\s*</think>\s*", "", clean)
+    clean = re.sub(r"(?is)<think>.*?</think>\s*", "", clean)
+    return clean.strip()
 
 def _image_text_is_weak(text: str) -> bool:
     cleaned = re.sub(r"\s+", " ", (text or "").strip()).strip(" .,:;!-").lower()
