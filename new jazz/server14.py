@@ -360,7 +360,6 @@ _executor = ThreadPoolExecutor(max_workers=16)
 GROQ_MODELS = {
     "llama-3.3-70b-versatile": {"label":"Llama 3.3 70B","ctx":32768,"fast":False,"provider":"groq","censored":True},
     "llama-3.1-8b-instant":    {"label":"Llama 3.1 8B (Fast)","ctx":131072,"fast":True,"provider":"groq","censored":True},
-    "qwen/qwen3-32b":           {"label":"Qwen3 32B (Groq)","ctx":131072,"fast":True,"provider":"groq","censored":True},
 }
 
 HUGGINGFACE_MODELS = {
