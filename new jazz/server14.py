@@ -2306,6 +2306,42 @@ async def _auto_route_model(preferred_model_id: str, message: str,
     preferred = await _ensure_user_model(user_id, preferred_model_id) if user_id else _canonical_model_id(preferred_model_id)
     estimated = _count_tokens(message or "")
     preferred_budget = await _context_input_budget(preferred)
+    code_like = _has_attached_or_pasted_context(message or "") or _looks_like_code_or_dev_context(message or "")
+    if code_like and estimated > 3000:
+        db_rows = await db_fetchall(
+            "SELECT id,provider,is_fast,is_code,context_length FROM ai_models "
+            "WHERE is_active=1 AND is_code=1")
+        row_map = {_canonical_model_id(r["id"]): r for r in db_rows}
+        candidates: List[str] = []
+        for r in db_rows:
+            mid = _canonical_model_id(r["id"])
+            if not mid:
+                continue
+            if user_id and not await _model_enabled_for_user(user_id, mid):
+                continue
+            if mid not in candidates:
+                candidates.append(mid)
+        if preferred not in candidates:
+            candidates.insert(0, preferred)
+        scored: List[Tuple[int, int, int, str]] = []
+        for mid in candidates:
+            row = row_map.get(_canonical_model_id(mid))
+            if not row:
+                continue
+            budget = await _context_input_budget(mid)
+            if budget <= estimated + 1024:
+                continue
+            provider = str(row.get("provider") or "").lower()
+            # Prefer fast working code models for pasted notebooks. NVIDIA Kimi stays as
+            # a large-context fallback, but it is too slow for routine code review.
+            provider_rank = 3 if provider == "groq" else 2 if provider in ("openai", "local_generate") else 1
+            fast_rank = 1 if int(row.get("is_fast") or 0) else 0
+            scored.append((provider_rank, fast_rank, min(int(row.get("context_length") or 0), 200000), mid))
+        if scored:
+            scored.sort(reverse=True)
+            best = scored[0][3]
+            if best != preferred:
+                return best, "code_input"
     if estimated <= int(preferred_budget * 0.82):
         return preferred, ""
     candidates = await _model_fallback_candidates(preferred, estimated, user_id)
@@ -8096,7 +8132,11 @@ async def chat_stream_post(req: ChatReq, user: Dict = Depends(_get_current_user)
         yield f"data: {json.dumps({'type':'start','session_id':sid,'mode':'normal','web_search':use_web,'plan_mode':plan_mode,'model_id':active_model_id,'model_label':await _model_display_name(active_model_id)})}\n\n"
         try:
             if route_reason and active_model_id != requested_model_id:
-                route_label = f"Long input detected. Switched to {await _model_display_name(active_model_id)}."
+                route_label = (
+                    f"Code/notebook paste detected. Switched to {await _model_display_name(active_model_id)}."
+                    if route_reason == "code_input"
+                    else f"Long input detected. Switched to {await _model_display_name(active_model_id)}."
+                )
                 ev = {
                     "type":"model_switch", "from_model_id":requested_model_id,
                     "model_id":active_model_id,
@@ -8667,12 +8707,17 @@ async def multi_model_chat(req: MultiModelChatReq, user: Dict = Depends(_get_cur
             llm_result = await _llm_text_with_fallback(messages, active_mid, max_tokens=2048, temperature=0.7, user_id=uid)
             final_mid = llm_result.get("model_id") or active_mid
             events = llm_result.get("events", [])
-            if route_reason == "long_input" and active_mid != requested_mid:
+            if route_reason and active_mid != requested_mid:
+                route_label = (
+                    f"Code/notebook paste detected. Routed this run to {await _model_display_name(active_mid)}."
+                    if route_reason == "code_input"
+                    else f"Long input detected. Routed this run to {await _model_display_name(active_mid)}."
+                )
                 events = [{
                     "type":"model_switch", "from_model_id":requested_mid,
                     "model_id":active_mid, "model_label":await _model_display_name(active_mid),
                     "selected":False,
-                    "label":f"Long input detected. Routed this run to {await _model_display_name(active_mid)}."
+                    "label":route_label
                 }] + events
             return {
                 "requested_model_id":requested_mid,
