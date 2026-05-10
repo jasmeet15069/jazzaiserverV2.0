@@ -2328,15 +2328,25 @@ async def _auto_route_model(preferred_model_id: str, message: str,
             row = row_map.get(_canonical_model_id(mid))
             if not row:
                 continue
-            budget = await _context_input_budget(mid)
-            if budget <= estimated + 1024:
-                continue
             provider = str(row.get("provider") or "").lower()
+            context_budget = await _context_input_budget(mid)
+            request_budget = await _model_request_input_budget(mid)
+            if provider == "groq":
+                # Groq on-demand can expose a huge context window while still enforcing
+                # a much smaller TPM/request ceiling. Let moderately long code compact
+                # into the fast route, but avoid guaranteed 413s for very large pastes.
+                if estimated > max(request_budget + 1024, request_budget * 8):
+                    continue
+                budget_score = request_budget
+            else:
+                if context_budget <= estimated + 1024:
+                    continue
+                budget_score = min(int(row.get("context_length") or context_budget), 200000)
             # Prefer fast working code models for pasted notebooks. NVIDIA Kimi stays as
             # a large-context fallback, but it is too slow for routine code review.
             provider_rank = 3 if provider == "groq" else 2 if provider in ("openai", "local_generate") else 1
             fast_rank = 1 if int(row.get("is_fast") or 0) else 0
-            scored.append((provider_rank, fast_rank, min(int(row.get("context_length") or 0), 200000), mid))
+            scored.append((provider_rank, fast_rank, budget_score, mid))
         if scored:
             scored.sort(reverse=True)
             best = scored[0][3]
@@ -3264,6 +3274,14 @@ async def _model_request_input_budget(model_id: str) -> int:
     if _is_local_jazz_model(mid):
         return max(192, min(768, LOCAL_JAZZ_FAST_INPUT_TOKENS))
     default_cap = int(os.getenv("MODEL_REQUEST_MAX_TOKENS") or "9000")
+    provider = str((BUILTIN_MODELS.get(mid) or {}).get("provider") or "").lower()
+    if not provider:
+        row = await db_fetchone(
+            "SELECT provider FROM ai_models WHERE (id=? OR name=? OR model_name=?) AND is_active=1 LIMIT 1",
+            (mid, mid, mid))
+        provider = str((row or {}).get("provider") or "").lower()
+    if provider == "groq":
+        default_cap = min(default_cap, int(os.getenv("GROQ_REQUEST_INPUT_TOKENS") or "4200"))
     if mid == "llama-3.1-8b-instant":
         default_cap = min(default_cap, 4200)
     elif mid == "llama-3.3-70b-versatile":
