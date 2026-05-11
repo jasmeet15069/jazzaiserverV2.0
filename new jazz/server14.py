@@ -2314,6 +2314,10 @@ async def _auto_route_model(preferred_model_id: str, message: str,
     preferred_is_code = bool(int((preferred_row or {}).get("is_code") or 0))
     weak_code_model = preferred in {LOCAL_JAZZ_MODEL_ID, "jazz-ai-testing", "llama-3.1-8b-instant"} or preferred_provider == "local_generate"
     needs_code_route = code_like and (estimated > 3000 or weak_code_model)
+    if code_like and preferred_provider == "groq":
+        request_budget = await _model_request_input_budget(preferred)
+        if estimated <= max(request_budget + 1024, request_budget * 8):
+            return preferred, ""
     if code_like and preferred_is_code and preferred_provider != "local_generate" and estimated <= int(preferred_budget * 0.82):
         needs_code_route = False
     if needs_code_route:
@@ -2321,6 +2325,18 @@ async def _auto_route_model(preferred_model_id: str, message: str,
             "SELECT id,name,provider,model_name,description,is_fast,is_code,context_length FROM ai_models "
             "WHERE is_active=1 AND is_code=1")
         row_map = {_canonical_model_id(r["id"]): r for r in db_rows}
+        if preferred in BUILTIN_MODELS and preferred not in row_map:
+            builtin = BUILTIN_MODELS[preferred]
+            row_map[preferred] = {
+                "id": preferred,
+                "name": builtin.get("label") or preferred,
+                "provider": builtin.get("provider") or "groq",
+                "model_name": preferred,
+                "description": "Built-in fast chat and coding model.",
+                "is_fast": int(bool(builtin.get("fast"))),
+                "is_code": 1,
+                "context_length": int(builtin.get("ctx") or 0),
+            }
         candidates: List[str] = []
         for r in db_rows:
             mid = _canonical_model_id(r["id"])
@@ -2352,21 +2368,27 @@ async def _auto_route_model(preferred_model_id: str, message: str,
                     continue
                 budget_score = min(int(row.get("context_length") or context_budget), 200000)
             hay = " ".join(str(row.get(k, "")) for k in ("id", "name", "model_name", "description")).lower()
-            # Prefer smarter code models for coding work; keep tiny local models as a last resort.
-            if "glm-5" in hay or "qwen3-coder" in hay or "coder" in hay:
+            # Prefer the user's selected working model when it can fit the paste.
+            # HF router code models are useful when explicitly selected, but should
+            # not steal long code pastes from a healthy built-in model.
+            if "qwen3-coder" in hay or "coder" in hay:
                 provider_rank = 7
-            elif provider == "openai":
-                provider_rank = 6
-            elif provider == "nvidia":
-                provider_rank = 5
-            elif provider == "huggingface":
-                provider_rank = 4
             elif provider == "groq":
+                provider_rank = 6
+            elif provider == "openai":
+                provider_rank = 5
+            elif provider == "nvidia":
+                provider_rank = 4
+            elif "glm-5" in hay:
+                provider_rank = 3
+            elif provider == "huggingface":
                 provider_rank = 3
             elif provider == "local_generate":
                 provider_rank = 1
             else:
                 provider_rank = 2
+            if mid == preferred and provider != "local_generate":
+                provider_rank += 2
             fast_rank = 1 if int(row.get("is_fast") or 0) else 0
             scored.append((provider_rank, fast_rank, budget_score, mid))
         if scored:
@@ -4051,6 +4073,14 @@ async def _build_context(session_id: str, user_id: str, new_msg: str,
     new_msg_compacted = False
     if effective_new_msg:
         user_budget = max(256, int(max(512, budget) * 0.78))
+        if _count_tokens(effective_new_msg) > user_budget and (
+            _has_attached_or_pasted_context(effective_new_msg)
+            or _looks_like_code_or_dev_context(effective_new_msg)
+        ):
+            # Source code and stack traces tokenize much denser than prose on
+            # provider tokenizers. Compact more aggressively so Groq's on-demand
+            # TPM cap is not exceeded after provider-side tokenization.
+            user_budget = max(256, int(user_budget * 0.28))
         safe_new_msg, new_msg_compacted = _fit_text_to_token_budget(effective_new_msg, user_budget)
         if new_msg_compacted:
             notice = (
