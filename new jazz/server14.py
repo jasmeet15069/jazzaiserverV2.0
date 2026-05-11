@@ -2860,12 +2860,17 @@ async def _image_to_text_model_id() -> Optional[str]:
         "ORDER BY updated_at DESC LIMIT 1")
     return row["id"] if row else None
 
+async def _nvidia_image_to_text_model_id() -> Optional[str]:
+    if not NVIDIA_API_KEY:
+        return None
+    row = await db_fetchone(
+        "SELECT id FROM ai_models WHERE id=? AND provider='nvidia' AND is_active=1 LIMIT 1",
+        ("nvidia-moonshotai-kimi-k2-6",))
+    return row["id"] if row else None
+
 async def _image_to_text_model_candidates(user_id: Optional[str] = None,
                                           preferred_model_id: str = "") -> List[str]:
     candidates: List[str] = []
-    internal = await _image_to_text_model_id()
-    if internal:
-        candidates.append(_canonical_model_id(internal))
     preferred = _canonical_model_id(preferred_model_id)
     if preferred and await _model_supports_vision(preferred):
         row = await db_fetchone(
@@ -2874,6 +2879,12 @@ async def _image_to_text_model_candidates(user_id: Optional[str] = None,
         if not (row and _model_is_internal(row)):
             if not user_id or await _model_enabled_for_user(user_id, preferred):
                 candidates.append(preferred)
+    nvidia_vision = await _nvidia_image_to_text_model_id()
+    if nvidia_vision:
+        candidates.append(_canonical_model_id(nvidia_vision))
+    internal = await _image_to_text_model_id()
+    if internal:
+        candidates.append(_canonical_model_id(internal))
     rows = await db_fetchall(
         "SELECT id,name,model_name,description,tags_json FROM ai_models WHERE is_active=1 AND is_vision=1 ORDER BY is_default DESC,is_fast DESC,name")
     allowed = set(await _allowed_model_ids_for_user(user_id)) if user_id else set()
@@ -2972,7 +2983,7 @@ async def _build_image_context(req: Any, user_id: str, model_id: str,
         return req.message, []
     extracted: List[Dict[str, Any]] = []
     for idx, img in enumerate(images, 1):
-        start = {"type":"tool_start","tool":"image_to_text","label":f"Reading image {idx}/{len(images)}"}
+        start = {"type":"tool_start","tool":"image_to_text","label":f"Analyzing image {idx}/{len(images)}"}
         if tool_log is not None:
             tool_log.append(start)
         if emit:
@@ -2985,7 +2996,7 @@ async def _build_image_context(req: Any, user_id: str, model_id: str,
             done = {
                 "type":"tool_result",
                 "tool":"image_to_text",
-                "label":label,
+                "label":"Image context ready" if label == "Image converted to text" else label,
                 "count":1,
                 "model_id":result.get("model_id"),
                 "model_label":result.get("model_label") or "Image-to-text model",
@@ -2997,7 +3008,7 @@ async def _build_image_context(req: Any, user_id: str, model_id: str,
             extracted.append({"name":img["name"], "mime":img["mime"], **result})
         except Exception as exc:
             logger.warning("[VISION] image-to-text extraction failed: %s", exc)
-            err = {"type":"tool_error","tool":"image_to_text","label":f"Image {idx} text extraction failed."}
+            err = {"type":"tool_error","tool":"image_to_text","label":f"Image {idx} analysis unavailable."}
             if tool_log is not None:
                 tool_log.append({**err, "image_name": img["name"], "error":str(exc)[:500]})
             if emit:
@@ -8439,7 +8450,7 @@ async def chat_stream_post(req: ChatReq, user: Dict = Depends(_get_current_user)
             if image_inputs:
                 extracted_images: List[Dict[str, Any]] = []
                 for img_idx, img in enumerate(image_inputs, 1):
-                    img_start = {"type":"tool_start","tool":"image_to_text","label":f"Reading image {img_idx}/{len(image_inputs)}"}
+                    img_start = {"type":"tool_start","tool":"image_to_text","label":f"Analyzing image {img_idx}/{len(image_inputs)}"}
                     tool_log.append(img_start)
                     yield f"data: {json.dumps(img_start)}\n\n"
                     try:
@@ -8448,7 +8459,7 @@ async def chat_stream_post(req: ChatReq, user: Dict = Depends(_get_current_user)
                         img_done = {
                             "type":"tool_result",
                             "tool":"image_to_text",
-                            "label":"Image converted to text with low confidence" if image_text_result.get("weak") else "Image converted to text",
+                            "label":"Image converted to text with low confidence" if image_text_result.get("weak") else "Image context ready",
                             "count":1,
                             "model_id":image_text_result.get("model_id"),
                             "model_label":image_text_result.get("model_label") or "Image-to-text model",
@@ -8458,10 +8469,22 @@ async def chat_stream_post(req: ChatReq, user: Dict = Depends(_get_current_user)
                         extracted_images.append({"name":img.get("name"), "mime":img.get("mime"), **image_text_result})
                     except Exception as exc:
                         logger.warning("[VISION] image-to-text extraction failed: %s", exc)
-                        err_ev = {"type":"tool_error","tool":"image_to_text","label":f"Image {img_idx} text extraction failed."}
+                        err_ev = {"type":"tool_error","tool":"image_to_text","label":f"Image {img_idx} analysis unavailable."}
                         tool_log.append({**err_ev, "image_name":img.get("name"), "error":str(exc)[:500]})
                         yield f"data: {json.dumps(err_ev)}\n\n"
                         extracted_images.append({"name":img.get("name"), "mime":img.get("mime"), "text":f"[Extraction failed: {exc}]", "weak":True})
+                if extracted_images and all(str(item.get("text") or "").startswith("[Extraction failed:") for item in extracted_images):
+                    reply = (
+                        "I couldn't read the attached image because every vision provider failed for this request. "
+                        "Please re-upload the image or try again in a moment; I won't pretend I can see details that were not processed."
+                    )
+                    async for ev in _stream_text(reply):
+                        yield f"data: {ev}\n\n"
+                    elapsed = int((time.time()-t0)*1000)
+                    mid = await _persist_chat_turn(sid, uid, req.message, reply, active_model_id, elapsed, tool_log, "tool")
+                    context = await _context_window_status(sid, uid, active_model_id)
+                    yield f"data: {json.dumps({'type':'done','message_id':mid,'content':reply,'latency_ms':elapsed,'tokens':{'input':_count_tokens(req.message),'output':_count_tokens(reply)},'mode':'tool','context':context,'model_id':active_model_id,'model_label':await _model_display_name(active_model_id)})}\n\n"
+                    return
                 context_parts = [
                     req.message,
                     "",
