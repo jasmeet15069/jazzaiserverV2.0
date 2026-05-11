@@ -791,13 +791,14 @@ try {
 // ═══════════════════════════════════════════════
 // CONFIG
 // ═══════════════════════════════════════════════
-const DEFAULT_API_BASE = 'https://imperceptibly-hymnlike-leesa.ngrok-free.dev';
+const DEFAULT_API_BASE = 'http://45.79.124.28:8000';
 let API = (localStorage.getItem('jazz_api') || DEFAULT_API_BASE || window.location.origin).replace(/\/+$/, '');
 let WS_URL = API.replace('https://', 'wss://').replace('http://', 'ws://');
 let _apiResolved = false;
 
 function isBlockedApiBase(base) {
-  return false;
+  const raw = String(base || '').trim();
+  return !raw || /\$\{|[{}]/.test(raw) || /^(undefined|null)$/i.test(raw) || /imperceptibly-hymnlike-leesa\.ngrok-free\.dev/i.test(raw);
 }
 
 function apiFetch(url, opts = {}) {
