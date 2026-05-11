@@ -203,6 +203,9 @@ LIVEKIT_URL        = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY    = os.getenv("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "")
 TTS_VOICE          = os.getenv("TTS_VOICE", "Fritz-PlayAI")
+TTS_MODEL          = os.getenv("TTS_MODEL", "canopylabs/orpheus-v1-english")
+TTS_ORPHEUS_VOICE  = os.getenv("TTS_ORPHEUS_VOICE", "troy")
+EDGE_TTS_VOICE     = os.getenv("EDGE_TTS_VOICE", "en-US-GuyNeural")
 LIVY_URL           = os.getenv("LIVY_URL", "http://localhost:8998")
 LIVY_USER          = os.getenv("LIVY_USER", "")
 LIVY_PASSWORD      = os.getenv("LIVY_PASSWORD", "")
@@ -233,7 +236,7 @@ _RUNTIME_ENV_KEYS = [
     "RAZORPAY_PRO_MONTHLY_AMOUNT", "RAZORPAY_PREMIUM_MONTHLY_AMOUNT", "RAZORPAY_ENTERPRISE_MONTHLY_AMOUNT",
     "APP_BASE_URL", "AUTH_LINK_BASE_URL", "PUBLIC_APP_URL",
     "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
-    "TTS_VOICE", "LIVY_URL", "LIVY_USER", "LIVY_PASSWORD",
+    "TTS_VOICE", "TTS_MODEL", "TTS_ORPHEUS_VOICE", "EDGE_TTS_VOICE", "LIVY_URL", "LIVY_USER", "LIVY_PASSWORD",
     "NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
     "SUPABASE_URL", "SUPABASE_PUBLISHABLE_KEY",
     "SUPABASE_OAUTH_CLIENT_ID", "SUPABASE_OAUTH_CLIENT_SECRET",
@@ -254,6 +257,9 @@ _RUNTIME_ENV_DEFAULTS = {
     "PUBLIC_APP_URL": "https://www.jazzai.online",
     "LIVY_URL": "http://localhost:8998",
     "TTS_VOICE": "Fritz-PlayAI",
+    "TTS_MODEL": "canopylabs/orpheus-v1-english",
+    "TTS_ORPHEUS_VOICE": "troy",
+    "EDGE_TTS_VOICE": "en-US-GuyNeural",
     "REQUIRE_EMAIL_VERIFICATION": "1",
     "EMAIL_VERIFICATION_EXPIRE_HOURS": "24",
     "EMAIL_VERIFICATION_RETURN_LINK": "0",
@@ -3907,6 +3913,54 @@ def _looks_like_code_or_dev_context(text: str) -> bool:
         if codeish >= 5:
             return True
     return False
+
+def _long_input_exact_reply(text: str) -> Optional[str]:
+    raw = text or ""
+    if len(raw) < 5000:
+        return None
+    tail = raw[-1600:].lower()
+    if not re.search(r"\b(how many|count|kitne|kitni)\b", tail):
+        return None
+
+    if re.search(r"\b(functions?|javascript functions?|js functions?)\b", tail):
+        declarations = re.findall(r"\bfunction\s+[$A-Za-z_][$\w]*\s*\(", raw)
+        if declarations:
+            return f"The pasted code contains {len(declarations)} JavaScript function declaration(s)."
+
+    if re.search(r"\blines?\b", tail):
+        return f"The pasted content contains {len(raw.splitlines())} line(s)."
+
+    if re.search(r"\b(chars?|characters?)\b", tail):
+        return f"The pasted content contains {len(raw)} character(s)."
+
+    return None
+
+async def _persist_chat_turn(
+    sid: str,
+    uid: str,
+    user_message: str,
+    assistant_reply: str,
+    model_id: str,
+    elapsed_ms: int,
+    tool_log: List[Dict[str, Any]],
+    mode: str = "normal",
+) -> str:
+    now = _utcnow()
+    mid = _new_id()
+    await db_execute(
+        "INSERT INTO chat_history(id,session_id,user_id,role,content,model_used,created_at) VALUES(?,?,?,'user',?,?,?)",
+        (_new_id(), sid, uid, user_message, model_id, now),
+    )
+    await db_execute(
+        "INSERT INTO chat_history(id,session_id,user_id,role,content,model_used,latency_ms,tool_calls_json,mode,created_at)"
+        " VALUES(?,?,?,'assistant',?,?,?,?,?,?)",
+        (mid, sid, uid, assistant_reply, model_id, elapsed_ms, json.dumps(tool_log), mode, now),
+    )
+    await db_execute(
+        "UPDATE chat_sessions SET model_id=?,last_message_at=?,turn_count=turn_count+1,updated_at=? WHERE id=?",
+        (model_id, now, now, sid),
+    )
+    return mid
 
 def _is_personal_fact_lookup(text: str) -> bool:
     raw = text or ""
@@ -8270,6 +8324,19 @@ async def chat_stream_post(req: ChatReq, user: Dict = Depends(_get_current_user)
                 yield f"data: {json.dumps({'type':'done','message_id':mid,'content':missing_context_reply,'latency_ms':elapsed,'tokens':{'input':_count_tokens(req.message),'output':_count_tokens(missing_context_reply)},'mode':'guard','context':context,'model_id':active_model_id,'model_label':await _model_display_name(active_model_id)})}\n\n"
                 return
 
+            exact_reply = _long_input_exact_reply(req.message)
+            if exact_reply:
+                ev = {"type":"tool_result","tool":"input_analyzer","label":"Counted exact pasted input structure","count":1}
+                tool_log.append(ev)
+                yield f"data: {json.dumps(ev)}\n\n"
+                async for chunk in _stream_text(exact_reply):
+                    yield f"data: {chunk}\n\n"
+                elapsed = int((time.time()-t0)*1000)
+                mid = await _persist_chat_turn(sid, uid, req.message, exact_reply, active_model_id, elapsed, tool_log, "tool")
+                context = await _context_window_status(sid, uid, active_model_id)
+                yield f"data: {json.dumps({'type':'done','message_id':mid,'content':exact_reply,'latency_ms':elapsed,'tokens':{'input':_count_tokens(req.message),'output':_count_tokens(exact_reply)},'mode':'tool','context':context,'model_id':active_model_id,'model_label':await _model_display_name(active_model_id)})}\n\n"
+                return
+
             latex_req = _latex_compile_request_from_message(req.message)
             if latex_req:
                 start_ev = {"type":"tool_start","tool":"latex","label":"Compiling LaTeX to PDF" if latex_req.output == "pdf" else "Preparing LaTeX source"}
@@ -8659,6 +8726,14 @@ async def chat_message(req: ChatReq, background: BackgroundTasks, user: Dict = D
         await db_execute("UPDATE chat_sessions SET model_id=?,last_message_at=?,turn_count=turn_count+1,updated_at=? WHERE id=?",(active_model_id,now,now,sid))
         context = await _context_window_status(sid, uid, active_model_id)
         return {"message_id":mid,"content":missing_context_reply,"session_id":sid,"latency_ms":elapsed,"context":context,"model_id":active_model_id,"model_label":await _model_display_name(active_model_id)}
+
+    exact_reply = _long_input_exact_reply(req.message)
+    if exact_reply:
+        elapsed = int((time.time()-t0)*1000)
+        tool_log.append({"type":"tool_result","tool":"input_analyzer","label":"Counted exact pasted input structure","count":1})
+        mid = await _persist_chat_turn(sid, uid, req.message, exact_reply, active_model_id, elapsed, tool_log, "tool")
+        context = await _context_window_status(sid, uid, active_model_id)
+        return {"message_id":mid,"content":exact_reply,"session_id":sid,"latency_ms":elapsed,"context":context,"model_id":active_model_id,"model_label":await _model_display_name(active_model_id)}
 
     effective_message, _ = await _build_image_context(req, uid, active_model_id, tool_log)
     messages = await _build_context(sid, uid, effective_message, use_rag, active_model_id,
@@ -9870,6 +9945,63 @@ async def transcribe_audio(file: UploadFile = File(...), user: Dict = Depends(_g
     transcript = await _stt_transcribe(content, file.content_type or "audio/webm")
     return {"transcript":transcript,"chars":len(transcript)}
 
+_ORPHEUS_ENGLISH_VOICES = {"autumn", "diana", "hannah", "austin", "daniel", "troy"}
+_ORPHEUS_ARABIC_VOICES = {"abdullah", "fahad", "sultan", "lulwa", "noura", "aisha"}
+
+def _tts_request_options(text: str, requested_voice: str = "") -> Tuple[str, str, str, str]:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean:
+        raise HTTPException(400, "text is required")
+    model = TTS_MODEL or "canopylabs/orpheus-v1-english"
+    fmt = "wav" if model.startswith("canopylabs/orpheus") else "mp3"
+    voice = (requested_voice or TTS_ORPHEUS_VOICE or TTS_VOICE or "troy").strip().lower()
+    if model == "canopylabs/orpheus-v1-english" and voice not in _ORPHEUS_ENGLISH_VOICES:
+        voice = TTS_ORPHEUS_VOICE if TTS_ORPHEUS_VOICE in _ORPHEUS_ENGLISH_VOICES else "troy"
+    if model == "canopylabs/orpheus-arabic-saudi" and voice not in _ORPHEUS_ARABIC_VOICES:
+        voice = "fahad"
+    limit = 200 if model.startswith("canopylabs/orpheus") else 4096
+    return model, voice, clean[:limit], fmt
+
+async def _groq_tts_audio(text: str, voice: str = "") -> Tuple[bytes, str]:
+    model, voice_id, input_text, response_format = _tts_request_options(text, voice)
+    client = _groq_client()
+    tts_resp = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: client.audio.speech.create(
+            model=model,
+            voice=voice_id,
+            input=input_text,
+            response_format=response_format,
+        ),
+    )
+    return tts_resp.content, response_format
+
+async def _edge_tts_audio(text: str, voice: str = "") -> Tuple[bytes, str]:
+    clean = re.sub(r"\s+", " ", (text or "").strip())
+    if not clean:
+        raise HTTPException(400, "text is required")
+    try:
+        import edge_tts
+    except Exception as exc:
+        raise RuntimeError(f"Edge TTS fallback is unavailable: {exc}") from exc
+    requested = (voice or "").strip()
+    voice_id = requested if requested.endswith("Neural") else EDGE_TTS_VOICE
+    audio = bytearray()
+    communicate = edge_tts.Communicate(clean[:4096], voice_id)
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            audio.extend(chunk.get("data") or b"")
+    if not audio:
+        raise RuntimeError("Edge TTS returned empty audio")
+    return bytes(audio), "mp3"
+
+async def _tts_audio(text: str, voice: str = "") -> Tuple[bytes, str]:
+    try:
+        return await _groq_tts_audio(text, voice)
+    except Exception as exc:
+        logger.warning("[TTS] Groq TTS unavailable; falling back to Edge TTS: %s", exc)
+        return await _edge_tts_audio(text, voice)
+
 @app.post("/voice/chat")
 async def voice_chat(req: VoiceChatReq, background: BackgroundTasks, user: Dict = Depends(_get_current_user)):
     await _check_rate_limit(user, "messages_per_day")
@@ -9886,27 +10018,21 @@ async def voice_chat(req: VoiceChatReq, background: BackgroundTasks, user: Dict 
     response: Dict = {"session_id":sid,"message_id":mid,"response":reply}
     if req.return_audio:
         try:
-            client = _groq_client()
-            tts_resp = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: client.audio.speech.create(
-                    model="playai-tts", voice=req.voice, input=reply[:4096], response_format="mp3"))
-            response["audio_base64"] = base64.b64encode(tts_resp.content).decode()
-            response["audio_format"] = "mp3"
+            audio, fmt = await _tts_audio(reply, req.voice)
+            response["audio_base64"] = base64.b64encode(audio).decode()
+            response["audio_format"] = fmt
         except Exception as e:
             response["tts_error"] = str(e)
     return response
 
 @app.post("/voice/tts")
 async def text_to_speech(body: dict, user: Dict = Depends(_get_current_user)):
-    text = body.get("text","")[:4096]
-    if not text.strip(): raise HTTPException(400, "text is required")
+    text = body.get("text","")
     try:
-        client = _groq_client()
-        tts_resp = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: client.audio.speech.create(
-                model="playai-tts", voice=body.get("voice",TTS_VOICE), input=text, response_format="mp3"))
-        return StreamingResponse(io.BytesIO(tts_resp.content), media_type="audio/mpeg",
-                                 headers={"Content-Disposition":"inline; filename=speech.mp3"})
+        audio, fmt = await _tts_audio(text, body.get("voice", TTS_VOICE))
+        media_type = "audio/wav" if fmt == "wav" else "audio/mpeg"
+        return StreamingResponse(io.BytesIO(audio), media_type=media_type,
+                                 headers={"Content-Disposition":f"inline; filename=speech.{fmt}"})
     except Exception as e:
         raise HTTPException(500, f"TTS failed: {e}")
 
