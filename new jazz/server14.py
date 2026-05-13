@@ -150,6 +150,7 @@ HF_TOKENS      = os.getenv("HF_TOKENS", "")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
 
 # ── OAuth Provider Credentials ────────────────────────────────────────────────
 GOOGLE_CLIENT_ID        = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -213,7 +214,7 @@ LIVY_PASSWORD      = os.getenv("LIVY_PASSWORD", "")
 _RUNTIME_ENV_KEYS = [
     "ADMIN_EMAIL", "ADMIN_PASSWORD", "GROQ_API_KEY", "HF_TOKEN", "HF_TOKEN_BACKUP",
     "HF_TOKEN_BACKUPS", "HF_TOKENS", "HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN",
-    "NVIDIA_API_KEY",
+    "NVIDIA_API_KEY", "MINIMAX_API_KEY",
     "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
     "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
     "GITLAB_CLIENT_ID", "GITLAB_CLIENT_SECRET",
@@ -432,6 +433,118 @@ DEFAULT_DB_MODELS = {
         "description":"Z.ai GLM 5.1 through Hugging Face Router using Together. Thinking is disabled for normal chat content.",
         "tags":["huggingface","router","together","glm","zai-org","tools","structured","most-intelligent"],
     },
+    "minimax-m2-7": {
+        "name":"MiniMax M2.7",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2.7",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":False,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2.7 via MiniMax OpenAI-compatible API. Strong long-context reasoning and coding model.",
+        "tags":["minimax","m2.7","thinking","code","long-context","most-intelligent"],
+    },
+    "minimax-m2-7-highspeed": {
+        "name":"MiniMax M2.7 Highspeed",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2.7-highspeed",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":True,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2.7 Highspeed via MiniMax OpenAI-compatible API. Faster variant for coding and agent tasks.",
+        "tags":["minimax","m2.7","highspeed","fast","thinking","code","long-context"],
+    },
+    "minimax-m2-5": {
+        "name":"MiniMax M2.5",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2.5",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":False,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2.5 via MiniMax OpenAI-compatible API for complex chat, coding, and agent tasks.",
+        "tags":["minimax","m2.5","thinking","code","long-context"],
+    },
+    "minimax-m2-5-highspeed": {
+        "name":"MiniMax M2.5 Highspeed",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2.5-highspeed",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":True,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2.5 Highspeed via MiniMax OpenAI-compatible API. Faster M2.5 variant.",
+        "tags":["minimax","m2.5","highspeed","fast","thinking","code","long-context"],
+    },
+    "minimax-m2-1": {
+        "name":"MiniMax M2.1",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2.1",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":False,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2.1 via MiniMax OpenAI-compatible API with multilingual programming capabilities.",
+        "tags":["minimax","m2.1","thinking","code","multilingual","long-context"],
+    },
+    "minimax-m2-1-highspeed": {
+        "name":"MiniMax M2.1 Highspeed",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2.1-highspeed",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":True,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2.1 Highspeed via MiniMax OpenAI-compatible API. Faster multilingual coding variant.",
+        "tags":["minimax","m2.1","highspeed","fast","thinking","code","multilingual","long-context"],
+    },
+    "minimax-m2": {
+        "name":"MiniMax M2",
+        "provider":"minimax",
+        "base_url":"https://api.minimax.io/v1",
+        "model_name":"MiniMax-M2",
+        "context_length":204800,
+        "max_output_tokens":8192,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":False,
+        "is_fast":False,
+        "is_vision":False,
+        "is_code":True,
+        "description":"MiniMax M2 via MiniMax OpenAI-compatible API for agentic reasoning and coding.",
+        "tags":["minimax","m2","thinking","code","agentic","long-context"],
+    },
     "jazz-ai-testing": {
         "name":"Jazz AI V1.0",
         "provider":"local_generate",
@@ -459,6 +572,7 @@ _PROVIDER_DEFAULTS: Dict[str,str] = {
     "openrouter":  "https://openrouter.ai/api/v1",
     "huggingface": "https://router.huggingface.co/v1",
     "nvidia":      "https://integrate.api.nvidia.com/v1",
+    "minimax":     "https://api.minimax.io/v1",
     "local_generate": "http://127.0.0.1:18080",
     "ollama":      "http://localhost:11434/v1",
     "mistral":     "https://api.mistral.ai/v1",
@@ -2095,8 +2209,12 @@ async def _get_model_client(model_id: str) -> Tuple[OpenAI, str]:
             api_key = GROQ_API_KEY
         if row["provider"] == "nvidia" and not api_key:
             api_key = NVIDIA_API_KEY
+        if row["provider"] == "minimax" and not api_key:
+            api_key = MINIMAX_API_KEY
         if row["provider"] == "nvidia":
             return OpenAI(api_key=api_key or "none", base_url=base_url, timeout=45.0), row["model_name"]
+        if row["provider"] == "minimax":
+            return OpenAI(api_key=api_key or "none", base_url=base_url, timeout=60.0), row["model_name"]
         return OpenAI(api_key=api_key or "none", base_url=base_url), row["model_name"]
     if model_id in HUGGINGFACE_MODELS:
         meta = HUGGINGFACE_MODELS[model_id]
@@ -2117,6 +2235,8 @@ async def _chat_completion_extra_body(model_id: str) -> Dict[str, Any]:
         return {"chat_template_kwargs": {"thinking": True}}
     if provider == "huggingface" and model_name == "zai-org/glm-5.1:together":
         return {"chat_template_kwargs": {"thinking": False}}
+    if provider == "minimax":
+        return {"reasoning_split": True}
     return {}
 
 async def _llm_text(messages: List[Dict], model_id: str = "llama-3.3-70b-versatile",
@@ -2190,6 +2310,28 @@ _MODEL_ALIASES = {
     "moonshotai/kimi-k2.6": "nvidia-moonshotai-kimi-k2-6",
     "moonshotai/kimi-k2-6": "nvidia-moonshotai-kimi-k2-6",
     "nvidia-kimi": "nvidia-moonshotai-kimi-k2-6",
+    "minimax": "minimax-m2-7",
+    "minimax-m2": "minimax-m2",
+    "minimax-m2.7": "minimax-m2-7",
+    "minimax-m2-7": "minimax-m2-7",
+    "minimax-m2.7-highspeed": "minimax-m2-7-highspeed",
+    "minimax-m2-7-highspeed": "minimax-m2-7-highspeed",
+    "minimax-fast": "minimax-m2-7-highspeed",
+    "minimax-m2.5": "minimax-m2-5",
+    "minimax-m2-5": "minimax-m2-5",
+    "minimax-m2.5-highspeed": "minimax-m2-5-highspeed",
+    "minimax-m2-5-highspeed": "minimax-m2-5-highspeed",
+    "minimax-m2.1": "minimax-m2-1",
+    "minimax-m2-1": "minimax-m2-1",
+    "minimax-m2.1-highspeed": "minimax-m2-1-highspeed",
+    "minimax-m2-1-highspeed": "minimax-m2-1-highspeed",
+    "MiniMax-M2.7": "minimax-m2-7",
+    "MiniMax-M2.7-highspeed": "minimax-m2-7-highspeed",
+    "MiniMax-M2.5": "minimax-m2-5",
+    "MiniMax-M2.5-highspeed": "minimax-m2-5-highspeed",
+    "MiniMax-M2.1": "minimax-m2-1",
+    "MiniMax-M2.1-highspeed": "minimax-m2-1-highspeed",
+    "MiniMax-M2": "minimax-m2",
 }
 
 def _canonical_model_id(model_id: str) -> str:
@@ -2384,6 +2526,8 @@ async def _auto_route_model(preferred_model_id: str, message: str,
             elif provider == "openai":
                 provider_rank = 5
             elif provider == "nvidia":
+                provider_rank = 4
+            elif provider == "minimax":
                 provider_rank = 4
             elif "glm-5" in hay:
                 provider_rank = 3
@@ -3176,6 +3320,8 @@ def _provider_failure_label(label: str, exc: Exception) -> str:
             f"{label} is unavailable because Hugging Face Inference Provider credits are depleted. "
             "Trying the next working model..."
         )
+    if "insufficient balance" in lower or "insufficient_balance" in lower:
+        return f"{label} provider account has insufficient balance/credits. Trying the next working model..."
     if "401" in err or "unauthorized" in lower or "invalid token" in lower:
         return f"{label} API key is not authorized. Trying the next working model..."
     if "404" in err or "not found" in lower:
@@ -3343,7 +3489,7 @@ async def _model_request_input_budget(model_id: str) -> int:
         provider = str((row or {}).get("provider") or "").lower()
     if provider == "groq":
         default_cap = min(default_cap, int(os.getenv("GROQ_REQUEST_INPUT_TOKENS") or "4200"))
-    elif provider in ("huggingface", "nvidia", "openai"):
+    elif provider in ("huggingface", "nvidia", "minimax", "openai"):
         model_limit = await _model_context_limit(mid)
         if model_limit >= 50000:
             default_cap = max(default_cap, int(os.getenv("MODEL_LARGE_CONTEXT_INPUT_TOKENS") or "60000"))
@@ -11324,7 +11470,7 @@ async def admin_delete_env(key: str, admin: Dict = Depends(_require_admin)):
 @app.get("/admin/system")
 async def admin_system(admin: Dict = Depends(_require_admin)):
     search_keys = ["BRAVE_SEARCH_API_KEY", "TAVILY_API_KEY", "SERPAPI_API_KEY"]
-    model_keys = ["GROQ_API_KEY", "HF_TOKEN"]
+    model_keys = ["GROQ_API_KEY", "HF_TOKEN", "HF_TOKEN_BACKUP", "NVIDIA_API_KEY", "MINIMAX_API_KEY"]
     oauth_keys = sorted({k for _, _, _, _, _, keys in _PLATFORM_CONNECTOR_CATALOG for k in keys})
     return {
         "frontend_path": str(FRONTEND_PATH),
