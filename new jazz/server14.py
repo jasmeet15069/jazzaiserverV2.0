@@ -2192,6 +2192,260 @@ def _hf_api_keys(primary: str = "") -> List[str]:
     seen: Set[str] = set()
     return [k for k in keys if k and not (k in seen or seen.add(k))]
 
+def _secret_fingerprint(value: str) -> str:
+    return hashlib.sha256((value or "").encode()).hexdigest()[:16]
+
+def _mask_secret_value(value: str, head: int = 8, tail: int = 4) -> str:
+    value = value or ""
+    if not value:
+        return ""
+    if len(value) <= head + tail + 3:
+        return value[:2] + "***" + value[-2:]
+    return value[:head] + "***" + value[-tail:]
+
+def _hf_token_usage_values(env: Dict[str, str], source_key: str, fingerprint: str, is_primary: bool) -> Dict[str, Any]:
+    fp = (fingerprint or "")[:12].upper()
+    try:
+        default_limit = float(env.get("HF_INFERENCE_MONTHLY_LIMIT_USD") or env.get("HF_FREE_CREDIT_USD") or "0.10")
+    except Exception:
+        default_limit = 0.10
+    used_keys = [
+        f"HF_USAGE_USD_{fp}",
+        f"{source_key}_USED_USD",
+        f"{source_key}_USAGE_USD",
+    ]
+    if is_primary:
+        used_keys.extend(["HF_INFERENCE_USED_USD", "HF_USAGE_USED_USD"])
+    limit_keys = [
+        f"HF_LIMIT_USD_{fp}",
+        f"{source_key}_LIMIT_USD",
+        f"{source_key}_QUOTA_USD",
+        "HF_INFERENCE_MONTHLY_LIMIT_USD",
+        "HF_FREE_CREDIT_USD",
+    ]
+    used_source = "default"
+    limit_source = "default_free_credit"
+    used = 0.0
+    limit = default_limit
+    for key in used_keys:
+        if key in env and str(env.get(key, "")).strip() != "":
+            try:
+                used = max(0.0, float(env.get(key, "0") or 0))
+                used_source = key
+                break
+            except Exception:
+                pass
+    for key in limit_keys:
+        if key in env and str(env.get(key, "")).strip() != "":
+            try:
+                limit = max(0.0001, float(env.get(key, "0.10") or default_limit))
+                limit_source = key
+                break
+            except Exception:
+                pass
+    percent = max(0.0, min(100.0, (used / limit) * 100.0 if limit else 0.0))
+    return {
+        "used_usd": round(used, 6),
+        "limit_usd": round(limit, 6),
+        "percent": round(percent, 2),
+        "used_source": used_source,
+        "limit_source": limit_source,
+        "usage_env_key": f"HF_USAGE_USD_{fp}",
+        "limit_env_key": f"HF_LIMIT_USD_{fp}",
+    }
+
+def _hf_token_classification(source_key: str, source_kind: str, is_primary: bool) -> Tuple[str, str, int]:
+    if is_primary:
+        return "primary", "Primary HF_TOKEN", 0
+    if source_kind == "model_key":
+        return "model_key", "Model-specific key", 50
+    if source_key in ("HF_TOKEN_BACKUP", "HF_TOKEN_BACKUPS", "HF_TOKENS"):
+        return "fallback", "Fallback pool", 20
+    if source_key in ("HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN"):
+        return "sdk_alias", "SDK alias", 30
+    if source_key.startswith("HF_") or source_key.startswith("HUGGINGFACE"):
+        return "extra", "Extra HF env key", 40
+    return "unknown", "Unknown", 90
+
+def _hf_whoami_sync(token: str) -> Dict[str, Any]:
+    req = urllib.request.Request(
+        "https://huggingface.co/api/whoami-v2",
+        headers={"Authorization": "Bearer " + (token or ""), "User-Agent": "JazzAI/14 admin-token-health"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            body = resp.read(512_000).decode("utf-8", "replace")
+            data = json.loads(body) if body else {}
+            headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+            auth = data.get("auth") or {}
+            access = auth.get("accessToken") or {}
+            fine = access.get("fineGrained") or {}
+            scopes: List[str] = []
+            if access.get("role"):
+                scopes.append("role:" + str(access.get("role")))
+            if isinstance(fine, dict):
+                scoped = fine.get("scoped")
+                if scoped is not None:
+                    scopes.append("fine_grained:" + ("yes" if scoped else "no"))
+                if fine.get("canReadGatedRepos"):
+                    scopes.append("gated:read")
+            return {
+                "status": "valid",
+                "http_status": resp.status,
+                "owner": data.get("name") or data.get("email") or "",
+                "scopes": scopes,
+                "rate_limit": {
+                    "limit": headers.get("ratelimit-limit") or headers.get("x-ratelimit-limit") or "",
+                    "remaining": headers.get("ratelimit-remaining") or headers.get("x-ratelimit-remaining") or "",
+                    "reset": headers.get("ratelimit-reset") or headers.get("x-ratelimit-reset") or "",
+                },
+            }
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read(4096).decode("utf-8", "replace")
+        except Exception:
+            detail = str(exc)
+        return {"status": "invalid", "http_status": exc.code, "owner": "", "scopes": [], "error": detail[:240]}
+    except Exception as exc:
+        return {"status": "unknown", "http_status": 0, "owner": "", "scopes": [], "error": str(exc)[:240]}
+
+async def _collect_hf_key_dashboard(validate: bool = True) -> Dict[str, Any]:
+    env = _env_read_pairs()
+    token_map: Dict[str, Dict[str, Any]] = {}
+    ordered_sources = [
+        ("HF_TOKEN", env.get("HF_TOKEN", ""), "primary"),
+        ("HUGGINGFACE_API_KEY", env.get("HUGGINGFACE_API_KEY", ""), "sdk_alias"),
+        ("HUGGINGFACEHUB_API_TOKEN", env.get("HUGGINGFACEHUB_API_TOKEN", ""), "sdk_alias"),
+        ("HF_TOKEN_BACKUP", env.get("HF_TOKEN_BACKUP", ""), "fallback"),
+        ("HF_TOKEN_BACKUPS", env.get("HF_TOKEN_BACKUPS", ""), "fallback"),
+        ("HF_TOKENS", env.get("HF_TOKENS", ""), "fallback"),
+    ]
+    known_keys = {k for k, _, _ in ordered_sources}
+    for key, value in sorted(env.items()):
+        if key in known_keys:
+            continue
+        if (key.startswith("HF_") or key.startswith("HUGGINGFACE")) and any(t.startswith("hf_") for t in _split_api_tokens(value)):
+            ordered_sources.append((key, value, "extra"))
+
+    primary_token = env.get("HF_TOKEN", "")
+    for source_key, raw_value, source_kind in ordered_sources:
+        for index, token in enumerate(_split_api_tokens(raw_value)):
+            fp = _secret_fingerprint(token)
+            is_primary = token == primary_token and source_key == "HF_TOKEN"
+            classification, label, rank = _hf_token_classification(source_key, source_kind, is_primary)
+            row = token_map.setdefault(fp, {
+                "fingerprint": fp,
+                "masked": _mask_secret_value(token),
+                "prefix": token[:8],
+                "suffix": token[-4:] if len(token) >= 4 else token,
+                "sources": [],
+                "classification": classification,
+                "classification_label": label,
+                "priority": rank,
+                "is_primary": False,
+                "can_promote": True,
+                "_token": token,
+                "_source_key": source_key,
+            })
+            row["sources"].append({"key": source_key, "index": index, "kind": source_kind})
+            if is_primary or rank < int(row.get("priority", 999)):
+                row["classification"] = classification
+                row["classification_label"] = label
+                row["priority"] = rank
+                row["_source_key"] = source_key
+            row["is_primary"] = bool(row["is_primary"] or is_primary)
+            row["can_promote"] = not row["is_primary"]
+
+    model_rows = await db_fetchall(
+        "SELECT id,name,provider,encrypted_api_key FROM ai_models WHERE lower(provider)='huggingface'"
+    )
+    for model in model_rows:
+        try:
+            creds = _decrypt(model["encrypted_api_key"] or "")
+            token = creds.get("key") or creds.get("api_key") or ""
+        except Exception:
+            token = ""
+        for index, token_value in enumerate(_split_api_tokens(token)):
+            fp = _secret_fingerprint(token_value)
+            row = token_map.setdefault(fp, {
+                "fingerprint": fp,
+                "masked": _mask_secret_value(token_value),
+                "prefix": token_value[:8],
+                "suffix": token_value[-4:] if len(token_value) >= 4 else token_value,
+                "sources": [],
+                "classification": "model_key",
+                "classification_label": "Model-specific key",
+                "priority": 50,
+                "is_primary": False,
+                "can_promote": True,
+                "_token": token_value,
+                "_source_key": "MODEL_KEY",
+            })
+            row["sources"].append({"key": "MODEL_KEY", "index": index, "kind": "model_key", "model_id": model["id"], "model_name": model["name"]})
+
+    tokens = sorted(token_map.values(), key=lambda r: (int(r.get("priority", 999)), str(r.get("fingerprint", ""))))
+    if validate and tokens:
+        loop = asyncio.get_running_loop()
+        checks = await asyncio.gather(*[
+            loop.run_in_executor(_executor, _hf_whoami_sync, str(row.get("_token", "")))
+            for row in tokens
+        ])
+        for row, health in zip(tokens, checks):
+            row.update(health)
+    else:
+        for row in tokens:
+            row.update({"status": "not_checked", "http_status": 0, "owner": "", "scopes": [], "rate_limit": {}})
+
+    valid_count = 0
+    used_total = 0.0
+    limit_total = 0.0
+    class_counts: Dict[str, int] = defaultdict(int)
+    for row in tokens:
+        row["usage"] = _hf_token_usage_values(env, str(row.get("_source_key") or "HF_TOKEN"), str(row.get("fingerprint") or ""), bool(row.get("is_primary")))
+        used_total += float(row["usage"]["used_usd"])
+        limit_total += float(row["usage"]["limit_usd"])
+        if row.get("status") == "valid":
+            valid_count += 1
+        class_counts[str(row.get("classification") or "unknown")] += 1
+        row.pop("_token", None)
+        row.pop("_source_key", None)
+
+    settings = []
+    for key, value in sorted(env.items()):
+        if key.startswith("HF_") or key.startswith("HUGGINGFACE"):
+            is_secret = bool(_ENV_SECRET_RE.search(key))
+            settings.append({
+                "key": key,
+                "value": _mask_secret_value(value) if is_secret else value,
+                "is_secret": is_secret,
+                "is_token_like": any(t.startswith("hf_") for t in _split_api_tokens(value)),
+            })
+
+    return {
+        "generated_at": _utcnow(),
+        "validate": validate,
+        "summary": {
+            "total": len(tokens),
+            "valid": valid_count,
+            "invalid": len([t for t in tokens if t.get("status") == "invalid"]),
+            "unknown": len([t for t in tokens if t.get("status") in ("unknown", "not_checked")]),
+            "primary": next((t for t in tokens if t.get("is_primary")), None),
+            "used_usd": round(used_total, 6),
+            "limit_usd": round(limit_total, 6),
+            "percent": round(max(0.0, min(100.0, (used_total / limit_total) * 100.0 if limit_total else 0.0)), 2),
+            "classes": dict(class_counts),
+        },
+        "tokens": tokens,
+        "settings": settings,
+        "usage_note": (
+            "Hugging Face documents free Inference Provider credits on the billing dashboard. "
+            "Exact dollar spend is shown by HF billing; Jazz AI tracks per-token bars from configured usage/limit env keys."
+        ),
+        "default_limit_usd": float(env.get("HF_INFERENCE_MONTHLY_LIMIT_USD") or env.get("HF_FREE_CREDIT_USD") or "0.10") if re.match(r"^\d+(\.\d+)?$", str(env.get("HF_INFERENCE_MONTHLY_LIMIT_USD") or env.get("HF_FREE_CREDIT_USD") or "0.10")) else 0.10,
+    }
+
 async def _get_model_client(model_id: str) -> Tuple[OpenAI, str]:
     model_id = _canonical_model_id(model_id)
     row = await db_fetchone("SELECT * FROM ai_models WHERE (id=? OR name=?) AND is_active=1 LIMIT 1",
@@ -7821,6 +8075,13 @@ class EnvVarCreate(BaseModel):
 class EnvVarUpdate(BaseModel):
     value: str = ""
 
+class HfKeyPromoteReq(BaseModel):
+    fingerprint: str = Field(..., min_length=8, max_length=64)
+
+class HfKeyUsageUpdate(BaseModel):
+    used_usd: float = Field(0.0, ge=0.0, le=1_000_000)
+    limit_usd: float = Field(0.10, gt=0.0, le=1_000_000)
+
 class ConnectorActionReq(BaseModel):
     action: str
     params: Dict = {}
@@ -11466,6 +11727,72 @@ async def admin_delete_env(key: str, admin: Dict = Depends(_require_admin)):
         (_new_id(), admin.get("id") or admin.get("sub",""), key, "env_delete",
          json.dumps({"path": str(path), "runtime": key in _RUNTIME_ENV_KEYS}), _utcnow()))
     return {"ok": True, "key": key, "path": str(path), "runtime_updated": key in _RUNTIME_ENV_KEYS}
+
+@app.get("/admin/hf-keys")
+async def admin_hf_keys(validate: bool = True, admin: Dict = Depends(_require_admin)):
+    return await _collect_hf_key_dashboard(validate=validate)
+
+@app.post("/admin/hf-keys/promote")
+async def admin_promote_hf_key(req: HfKeyPromoteReq, admin: Dict = Depends(_require_admin)):
+    dashboard = await _collect_hf_key_dashboard(validate=False)
+    target = None
+    for row in dashboard.get("tokens", []):
+        if str(row.get("fingerprint", "")).startswith(req.fingerprint):
+            target = row
+            break
+    if not target:
+        raise HTTPException(404, "HF token fingerprint not found")
+
+    env = _env_read_pairs()
+    token_by_fp: Dict[str, str] = {}
+    for key, value in env.items():
+        if key in ("HF_TOKEN", "HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN", "HF_TOKEN_BACKUP", "HF_TOKEN_BACKUPS", "HF_TOKENS") or key.startswith("HF_") or key.startswith("HUGGINGFACE"):
+            for token in _split_api_tokens(value):
+                if token.startswith("hf_"):
+                    token_by_fp[_secret_fingerprint(token)] = token
+    model_rows = await db_fetchall("SELECT encrypted_api_key FROM ai_models WHERE lower(provider)='huggingface'")
+    for row in model_rows:
+        try:
+            creds = _decrypt(row["encrypted_api_key"] or "")
+            for token in _split_api_tokens(creds.get("key") or creds.get("api_key") or ""):
+                token_by_fp[_secret_fingerprint(token)] = token
+        except Exception:
+            pass
+
+    new_primary = token_by_fp.get(str(target.get("fingerprint")))
+    if not new_primary:
+        raise HTTPException(404, "HF token value is not available for promotion")
+    current_tokens = []
+    for key in ("HF_TOKEN", "HF_TOKEN_BACKUP", "HF_TOKEN_BACKUPS", "HF_TOKENS", "HUGGINGFACE_API_KEY", "HUGGINGFACEHUB_API_TOKEN"):
+        current_tokens.extend(_split_api_tokens(env.get(key, "")))
+    backups: List[str] = []
+    for token in current_tokens:
+        if token and token != new_primary and token not in backups:
+            backups.append(token)
+    _env_write_value("HF_TOKEN", new_primary)
+    _env_write_value("HF_TOKEN_BACKUPS", ",".join(backups))
+    await db_execute(
+        "INSERT INTO audit_log(id,actor_id,target_id,action,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+        (_new_id(), admin.get("id") or admin.get("sub",""), str(target.get("fingerprint")), "hf_token_promote",
+         json.dumps({"masked": target.get("masked"), "fallback_count": len(backups)}), _utcnow()))
+    return {"ok": True, "fingerprint": target.get("fingerprint"), "masked": target.get("masked"), "fallback_count": len(backups)}
+
+@app.put("/admin/hf-keys/{fingerprint}/usage")
+async def admin_update_hf_key_usage(fingerprint: str, req: HfKeyUsageUpdate, admin: Dict = Depends(_require_admin)):
+    dashboard = await _collect_hf_key_dashboard(validate=False)
+    target = next((row for row in dashboard.get("tokens", []) if str(row.get("fingerprint", "")).startswith(fingerprint)), None)
+    if not target:
+        raise HTTPException(404, "HF token fingerprint not found")
+    fp = str(target.get("fingerprint"))[:12].upper()
+    usage_key = f"HF_USAGE_USD_{fp}"
+    limit_key = f"HF_LIMIT_USD_{fp}"
+    _env_write_value(usage_key, f"{float(req.used_usd):.6f}".rstrip("0").rstrip("."))
+    _env_write_value(limit_key, f"{float(req.limit_usd):.6f}".rstrip("0").rstrip("."))
+    await db_execute(
+        "INSERT INTO audit_log(id,actor_id,target_id,action,detail_json,created_at) VALUES(?,?,?,?,?,?)",
+        (_new_id(), admin.get("id") or admin.get("sub",""), str(target.get("fingerprint")), "hf_token_usage_set",
+         json.dumps({"usage_key": usage_key, "limit_key": limit_key, "used_usd": req.used_usd, "limit_usd": req.limit_usd}), _utcnow()))
+    return {"ok": True, "fingerprint": target.get("fingerprint"), "usage_key": usage_key, "limit_key": limit_key}
 
 @app.get("/admin/system")
 async def admin_system(admin: Dict = Depends(_require_admin)):
