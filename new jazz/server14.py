@@ -342,6 +342,8 @@ SUBSCRIPTION_LIMITS: Dict[str, Dict[str, Any]] = {
     "enterprise": {"messages_per_day":-1,"documents":-1,"max_file_mb":200,"agent_jobs":-1,"websites":-1,"code_runs_per_day":-1,"api_keys":-1,"memories":-1,"connectors":-1},
 }
 PLAN_TIERS = ("free", "pro", "premium", "enterprise")
+DEFAULT_CHAT_MODEL_ID = "nvidia-z-ai-glm-5-1"
+MODEL_ACCESS_POLICY_VERSION = "2026-05-13-nvidia-glm51-hf-paid-v1"
 RATE_LIMIT_RESOURCES = [
     ("messages_per_day", "Messages per day", "Chat, multi-model, voice, and agent message budget."),
     ("documents", "Documents", "Processed documents a user can keep."),
@@ -400,6 +402,22 @@ DEFAULT_DB_MODELS = {
         "is_code":False,
         "description":"Uncensored, steerable Dolphin Mistral 24B Venice Edition via Hugging Face Inference Providers using Featherless AI.",
         "tags":["protected","uncensored","dolphin","huggingface","featherless-ai","venice","24b"],
+    },
+    "nvidia-z-ai-glm-5-1": {
+        "name":"GLM 5.1 (NVIDIA)",
+        "provider":"nvidia",
+        "base_url":"https://integrate.api.nvidia.com/v1",
+        "model_name":"z-ai/glm-5.1",
+        "context_length":262144,
+        "max_output_tokens":16384,
+        "temperature_default":1.0,
+        "is_active":True,
+        "is_default":True,
+        "is_fast":False,
+        "is_vision":False,
+        "is_code":True,
+        "description":"Z.ai GLM 5.1 via NVIDIA NIM/OpenAI-compatible chat completions with thinking enabled.",
+        "tags":["default","nvidia","z-ai","glm","glm-5.1","thinking","code","most-intelligent"],
     },
     "nvidia-moonshotai-kimi-k2-6": {
         "name":"Kimi K2.6 (NVIDIA)",
@@ -565,7 +583,7 @@ DEFAULT_DB_MODELS = {
 
 IMAGE_TO_TEXT_MODEL_ID = "hf-router-qwen-qwen2-5-vl-72b-instruct-ovhcloud"
 IMAGE_TO_TEXT_MODEL_NAME = "Qwen/Qwen2.5-VL-72B-Instruct:ovhcloud"
-DEFAULT_TEXT_MODEL_ID = "local-dolphin3-qwen25-05b"
+DEFAULT_TEXT_MODEL_ID = DEFAULT_CHAT_MODEL_ID
 
 _PROVIDER_DEFAULTS: Dict[str,str] = {
     "groq":        "https://api.groq.com/openai/v1",
@@ -712,6 +730,33 @@ async def _seed_default_ai_models(created_by: str) -> None:
              float(cfg["temperature_default"]), cfg["description"],
              json.dumps(cfg["tags"]), created_by, now, now))
         logger.info("[INIT] Seeded default model: %s", cfg["name"])
+
+async def _ensure_default_chat_model(created_by: str) -> None:
+    cfg = DEFAULT_DB_MODELS[DEFAULT_CHAT_MODEL_ID]
+    now = _utcnow()
+    row = await db_fetchone("SELECT id FROM ai_models WHERE id=?", (DEFAULT_CHAT_MODEL_ID,))
+    if not row:
+        await db_execute(
+            "INSERT INTO ai_models(id,name,provider,base_url,model_name,encrypted_api_key,"
+            "is_active,is_default,is_fast,is_vision,is_code,context_length,max_output_tokens,"
+            "temperature_default,description,tags_json,created_by,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (DEFAULT_CHAT_MODEL_ID, cfg["name"], cfg["provider"], cfg["base_url"], cfg["model_name"],
+             _encrypt({"key": ""}), 1, 1, int(cfg["is_fast"]), int(cfg["is_vision"]),
+             int(cfg["is_code"]), int(cfg["context_length"]), int(cfg["max_output_tokens"]),
+             float(cfg["temperature_default"]), cfg["description"], json.dumps(cfg["tags"]),
+             created_by, now, now))
+    else:
+        await db_execute(
+            "UPDATE ai_models SET name=?,provider=?,base_url=?,model_name=?,is_active=1,"
+            "is_default=1,is_fast=?,is_vision=?,is_code=?,context_length=?,max_output_tokens=?,"
+            "temperature_default=?,description=?,tags_json=?,updated_at=? WHERE id=?",
+            (cfg["name"], cfg["provider"], cfg["base_url"], cfg["model_name"],
+             int(cfg["is_fast"]), int(cfg["is_vision"]), int(cfg["is_code"]),
+             int(cfg["context_length"]), int(cfg["max_output_tokens"]),
+             float(cfg["temperature_default"]), cfg["description"], json.dumps(cfg["tags"]),
+             now, DEFAULT_CHAT_MODEL_ID))
+    await db_execute("UPDATE ai_models SET is_default=0,updated_at=? WHERE id!=?", (now, DEFAULT_CHAT_MODEL_ID))
 
 async def _ensure_image_to_text_model(created_by: str) -> None:
     now = _utcnow()
@@ -2487,13 +2532,15 @@ async def _chat_completion_extra_body(model_id: str) -> Dict[str, Any]:
     model_name = str(row.get("model_name") or "").lower()
     if provider == "nvidia" and model_name == "moonshotai/kimi-k2.6":
         return {"chat_template_kwargs": {"thinking": True}}
+    if provider == "nvidia" and model_name == "z-ai/glm-5.1":
+        return {"chat_template_kwargs": {"enable_thinking": True, "clear_thinking": False}}
     if provider == "huggingface" and model_name == "zai-org/glm-5.1:together":
         return {"chat_template_kwargs": {"thinking": False}}
     if provider == "minimax":
         return {"reasoning_split": True}
     return {}
 
-async def _llm_text(messages: List[Dict], model_id: str = "llama-3.3-70b-versatile",
+async def _llm_text(messages: List[Dict], model_id: str = DEFAULT_CHAT_MODEL_ID,
                     max_tokens: int = 1024, temperature: float = 0.7) -> str:
     client, model_name = await _get_model_client(model_id)
     extra_body = await _chat_completion_extra_body(model_id)
@@ -2564,6 +2611,13 @@ _MODEL_ALIASES = {
     "moonshotai/kimi-k2.6": "nvidia-moonshotai-kimi-k2-6",
     "moonshotai/kimi-k2-6": "nvidia-moonshotai-kimi-k2-6",
     "nvidia-kimi": "nvidia-moonshotai-kimi-k2-6",
+    "glm": "nvidia-z-ai-glm-5-1",
+    "glm-5.1": "nvidia-z-ai-glm-5-1",
+    "z-ai/glm-5.1": "nvidia-z-ai-glm-5-1",
+    "z-ai/glm-5-1": "nvidia-z-ai-glm-5-1",
+    "nvidia-glm": "nvidia-z-ai-glm-5-1",
+    "nvidia-glm-5.1": "nvidia-z-ai-glm-5-1",
+    "nvidia-z-ai": "nvidia-z-ai-glm-5-1",
     "minimax": "minimax-m2-7",
     "minimax-m2": "minimax-m2",
     "minimax-m2.7": "minimax-m2-7",
@@ -2589,7 +2643,7 @@ _MODEL_ALIASES = {
 }
 
 def _canonical_model_id(model_id: str) -> str:
-    raw = (model_id or "llama-3.3-70b-versatile").strip()
+    raw = (model_id or DEFAULT_CHAT_MODEL_ID).strip()
     return _MODEL_ALIASES.get(raw) or _MODEL_ALIASES.get(raw.lower()) or raw
 
 def _is_local_jazz_model(model_id: str) -> bool:
@@ -2638,7 +2692,7 @@ async def _all_active_model_ids(user_id: Optional[str] = None) -> List[str]:
         "SELECT id,name,model_name,description,tags_json FROM ai_models WHERE is_active=1 ORDER BY is_default DESC,is_fast DESC,name")
     ids.extend(r["id"] for r in rows if r["id"] in allowed and not _model_is_internal(r))
     if not ids:
-        ids = ["llama-3.3-70b-versatile"]
+        ids = [DEFAULT_CHAT_MODEL_ID]
     seen, out = set(), []
     for mid in ids:
         mid = _canonical_model_id(mid)
@@ -3620,8 +3674,13 @@ def _nvidia_provider_model_attempts(model_name: str) -> List[str]:
 def _nvidia_stream_timeout(provider_model: str) -> int:
     return max(8, int(NVIDIA_STREAM_TIMEOUTS.get(provider_model, 45)))
 
-def _nvidia_enable_thinking(provider_model: str) -> bool:
-    return provider_model in {"moonshotai/kimi-k2.6", "moonshotai/kimi-k2-thinking"}
+def _nvidia_chat_template_kwargs(provider_model: str) -> Optional[Dict[str, Any]]:
+    model = str(provider_model or "").lower()
+    if model == "z-ai/glm-5.1":
+        return {"enable_thinking": True, "clear_thinking": False}
+    if model in {"moonshotai/kimi-k2.6", "moonshotai/kimi-k2-thinking"}:
+        return {"thinking": True}
+    return None
 
 async def _stream_nvidia_text_once(messages: List[Dict], model_id: str,
                                    max_tokens: int = 1024,
@@ -3653,8 +3712,9 @@ async def _stream_nvidia_text_once(messages: List[Dict], model_id: str,
                     "top_p": 1.0,
                     "stream": True,
                 }
-                if _nvidia_enable_thinking(provider_model):
-                    payload["chat_template_kwargs"] = {"thinking": True}
+                template_kwargs = _nvidia_chat_template_kwargs(provider_model)
+                if template_kwargs:
+                    payload["chat_template_kwargs"] = template_kwargs
                 req = urllib.request.Request(
                     meta["base_url"] + "/chat/completions",
                     data=json.dumps(payload).encode("utf-8"),
@@ -4578,7 +4638,7 @@ async def _context_window_status(session_id: str, user_id: str, model_id: Option
         (session_id, user_id))
     if not session:
         raise HTTPException(404, "Session not found")
-    mid = model_id or session["model_id"] or "llama-3.3-70b-versatile"
+    mid = model_id or session["model_id"] or DEFAULT_CHAT_MODEL_ID
     context_limit = await _model_context_limit(mid)
     request_budget = await _context_input_budget(mid)
     messages = await _build_context(session_id, user_id, "", False, mid)
@@ -5273,7 +5333,9 @@ async def lifespan(app: FastAPI):
         if os.getenv("HF_ROUTER_MODEL_SEED", "1").lower() not in ("0", "false", "no"):
             await _seed_hf_router_models(admin["id"])
         await _ensure_image_to_text_model(admin["id"])
+        await _ensure_default_chat_model(admin["id"])
         await _seed_model_access()
+        await _apply_default_model_access_policy(admin["id"])
 
     # Schedule existing jobs
     jobs = await db_fetchall("SELECT * FROM agent_jobs WHERE enabled=1")
@@ -6817,7 +6879,7 @@ async def _run_agent_job(job_id: str):
     for attempt in range(job.get("max_retries",2)+1):
         try:
             result_text, tool_log = await _agent_loop(
-                job["prompt_template"], user, tools, job.get("model_id","llama-3.3-70b-versatile"),
+                job["prompt_template"], user, tools, job.get("model_id", DEFAULT_CHAT_MODEL_ID),
                 max_steps=12)
             run_status = "success"; break
         except Exception as e:
@@ -7133,6 +7195,31 @@ async def _seed_model_access() -> None:
                 "UPDATE model_access SET display_name=?,source='db',updated_at=? WHERE model_id=?",
                 (row.get("name") or row["id"], now, row["id"]))
 
+def _default_plan_model_enabled(plan: str, row: Dict[str, Any]) -> bool:
+    provider = str(row.get("provider") or "").lower()
+    if provider == "huggingface" and plan == "free":
+        return False
+    return True
+
+async def _apply_default_model_access_policy(admin_uid: str) -> None:
+    current = await _setting_get("model_access_policy_version", "")
+    if current == MODEL_ACCESS_POLICY_VERSION:
+        return
+    now = _utcnow()
+    rows = await _model_access_rows(include_inactive_db=True)
+    for row in rows:
+        mid = _canonical_model_id(row["id"])
+        if _model_is_internal(row):
+            continue
+        for plan in PLAN_TIERS:
+            enabled = _default_plan_model_enabled(plan, row)
+            await db_execute(
+                "INSERT INTO plan_model_access(id,plan,model_id,is_enabled,updated_by,updated_at)"
+                " VALUES(?,?,?,?,?,?) ON CONFLICT(plan,model_id) DO UPDATE SET "
+                "is_enabled=excluded.is_enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (_new_id(), plan, mid, 1 if enabled else 0, admin_uid, now))
+    await _setting_set("model_access_policy_version", MODEL_ACCESS_POLICY_VERSION, admin_uid)
+
 async def _model_access_rows(include_inactive_db: bool = True) -> List[Dict]:
     await _seed_model_access()
     access = {
@@ -7150,7 +7237,7 @@ async def _model_access_rows(include_inactive_db: bool = True) -> List[Dict]:
             "model_name": mid,
             "is_active": bool(a.get("is_enabled", 1)),
             "access_enabled": bool(a.get("is_enabled", 1)),
-            "is_default": mid == "llama-3.3-70b-versatile",
+            "is_default": mid == DEFAULT_CHAT_MODEL_ID,
             "is_fast": bool(cfg.get("fast")),
             "is_vision": False,
             "is_code": False,
@@ -7204,7 +7291,7 @@ async def _model_access_for_user(user_id: str) -> Dict[str, Any]:
             continue
         mid = row["id"]
         global_enabled = bool(row.get("access_enabled", row.get("is_active", True)))
-        plan_enabled = plan_access.get(mid, True)
+        plan_enabled = plan_access.get(mid, _default_plan_model_enabled(plan, row))
         override = overrides.get(mid)
         effective = global_enabled and plan_enabled and (override is not False)
         item = dict(row)
@@ -7236,7 +7323,7 @@ async def _ensure_user_model(user_id: str, model_id: str) -> str:
     if await _model_enabled_for_user(user_id, mid):
         return mid
     allowed = await _allowed_model_ids_for_user(user_id)
-    return allowed[0] if allowed else "llama-3.3-70b-versatile"
+    return allowed[0] if allowed else DEFAULT_CHAT_MODEL_ID
 
 _PASTED_CONTENT_BLOCK_RE = re.compile(
     r"<JAZZ_PASTED_CONTENT\b[^>]*>.*?</JAZZ_PASTED_CONTENT>",
@@ -7801,7 +7888,7 @@ class ChangePasswordReq(BaseModel):
 class ChatReq(BaseModel):
     message: str = Field(..., min_length=1, max_length=1_000_000)
     session_id: Optional[str] = None
-    model_id: str = "llama-3.3-70b-versatile"
+    model_id: str = DEFAULT_CHAT_MODEL_ID
     use_rag: bool = True
     web_search: bool = False
     plan_mode: bool = False
@@ -7849,7 +7936,7 @@ class LatexCompileReq(BaseModel):
 class AgentRunReq(BaseModel):
     prompt: str = Field(..., min_length=5)
     tools: List[str] = []
-    model_id: str = "llama-3.3-70b-versatile"
+    model_id: str = DEFAULT_CHAT_MODEL_ID
     session_id: Optional[str] = None
     timeout_seconds: int = Field(90, ge=10, le=300)
 
@@ -7866,7 +7953,7 @@ class AgentJobCreate(BaseModel):
     trigger_json: str = "{}"
     prompt_template: str = Field(..., min_length=5)
     tools_json: str = '["code_exec","shell","rag_search"]'
-    model_id: str = "llama-3.3-70b-versatile"
+    model_id: str = DEFAULT_CHAT_MODEL_ID
     max_retries: int = Field(2, ge=0, le=5)
     timeout_seconds: int = Field(120, ge=10, le=600)
 
@@ -7975,7 +8062,7 @@ class WebsiteCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
     description: str = Field(..., min_length=5)
     style: str = "modern"
-    model_id: str = "llama-3.3-70b-versatile"
+    model_id: str = DEFAULT_CHAT_MODEL_ID
     pages: Optional[List[str]] = None
     color_palette: Optional[str] = None
     extra_instructions: Optional[str] = None
@@ -7993,7 +8080,7 @@ class WebsiteCreate(BaseModel):
 
 class WebsiteIterateReq(BaseModel):
     change_request: str = Field(..., min_length=3, max_length=20000)
-    model_id: str = "llama-3.3-70b-versatile"
+    model_id: str = DEFAULT_CHAT_MODEL_ID
     save_as_new: bool = False
     preserve_brand: bool = True
 
@@ -8026,7 +8113,7 @@ class LiveVoiceSessionReq(BaseModel):
 class VoiceChatReq(BaseModel):
     transcript: str
     session_id: Optional[str] = None
-    model_id: str = "llama-3.3-70b-versatile"
+    model_id: str = DEFAULT_CHAT_MODEL_ID
     return_audio: bool = False
     voice: str = TTS_VOICE
 
@@ -8473,7 +8560,7 @@ async def search_sessions(q: str = "", limit: int = 50, user: Dict = Depends(_ge
 async def create_session(body: dict, user: Dict = Depends(_get_current_user)):
     uid = user.get("id") or user.get("sub","")
     sid = _new_id(); now = _utcnow()
-    model = body.get("model_id","llama-3.3-70b-versatile")
+    model = body.get("model_id", DEFAULT_CHAT_MODEL_ID)
     await db_execute(
         "INSERT INTO chat_sessions(id,user_id,title,model_id,created_at,updated_at) VALUES(?,?,?,?,?,?)",
         (sid, uid, body.get("title","New Chat"), model, now, now))
@@ -8584,7 +8671,7 @@ async def compact_session_context(sid: str, body: dict = None,
     uid = user.get("id") or user.get("sub","")
     session = await db_fetchone("SELECT id,model_id FROM chat_sessions WHERE id=? AND user_id=?", (sid, uid))
     if not session: raise HTTPException(404)
-    model_id = (body or {}).get("model_id") or session["model_id"] or "llama-3.3-70b-versatile"
+    model_id = (body or {}).get("model_id") or session["model_id"] or DEFAULT_CHAT_MODEL_ID
     return await _compact_session_context(sid, uid, model_id, reason="manual")
 
 @app.post("/sessions/{sid}/branch")
@@ -9101,7 +9188,7 @@ async def chat_stream_post(req: ChatReq, user: Dict = Depends(_get_current_user)
 
 @app.get("/chat/stream")
 async def chat_stream_get(
-    message: str, model_id: str = "llama-3.3-70b-versatile", use_rag: bool = True,
+    message: str, model_id: str = DEFAULT_CHAT_MODEL_ID, use_rag: bool = True,
     session_id: Optional[str] = None, force_thinking: Optional[bool] = None,
     web_search: bool = False, plan_mode: bool = False,
     skill_ids: str = "", tools_json: str = "", image_url: Optional[str] = None,
@@ -10174,7 +10261,7 @@ async def generate_website(body: dict, user: Dict = Depends(_get_current_user)):
     req = WebsiteCreate(title=body.get("title","My Website"),
                         description=body.get("prompt","A modern landing page"),
                         style=body.get("style","modern"),
-                        model_id=body.get("model_id","llama-3.3-70b-versatile"))
+                        model_id=body.get("model_id", DEFAULT_CHAT_MODEL_ID))
     return await build_website_ep(req, user)
 
 @app.get("/websites")
@@ -11181,7 +11268,7 @@ async def admin_test_skill(skill_id: str, body: dict, admin: Dict = Depends(_req
         {"role":"system","content":_format_skill_context([skill])},
         {"role":"user","content":prompt},
     ]
-    answer = await _llm_text(messages, body.get("model_id","llama-3.3-70b-versatile"), max_tokens=1000)
+    answer = await _llm_text(messages, body.get("model_id", DEFAULT_CHAT_MODEL_ID), max_tokens=1000)
     return {"skill": skill, "prompt": prompt, "answer": answer}
 
 @app.post("/admin/broadcast")
@@ -12130,7 +12217,7 @@ async def admin_role_permissions(admin: Dict = Depends(_require_admin)):
             "plan": plan,
             "limits": limits_by_plan.get(plan, {}),
             "features": [{**dict(f), "plan_enabled": f_map.get((plan, f["feature_key"]), True)} for f in features],
-            "models": [{**dict(m), "plan_enabled": m_map.get((plan, m["id"]), True)} for m in models],
+            "models": [{**dict(m), "plan_enabled": m_map.get((plan, m["id"]), _default_plan_model_enabled(plan, m))} for m in models],
         })
     return {"plans": plans}
 

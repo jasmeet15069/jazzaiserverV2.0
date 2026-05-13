@@ -987,8 +987,8 @@ const SIDEBAR_FEATURES = [
 ];
 const WORKSPACE_TOOL_FEATURE_KEYS = new Set(['documents','memory','connectors','mcp','livy','apikeys']);
 const SIDEBAR_FEATURE_BY_PAGE = Object.fromEntries(SIDEBAR_FEATURES.map(f => [f.page, f]));
-const DEFAULT_MODEL_ID = 'dolphin-mistral-24b-venice-hf';
-const MODEL_DEFAULT_VERSION = 'dolphin-venice-hf-token-20260428';
+const DEFAULT_MODEL_ID = 'nvidia-z-ai-glm-5-1';
+const MODEL_DEFAULT_VERSION = 'nvidia-glm-5-1-default-20260513';
 
 function localSidebarFeatureRow(f, isEnabled = true) {
   return { feature_key:f.key, page_key:f.page, display_name:f.label, icon:f.icon, is_enabled:isEnabled };
@@ -1018,6 +1018,7 @@ const S = {
   modelId: DEFAULT_MODEL_ID, useRag: true, useWeb: true, planMode: false, agentMode: false,
   notifications: [], notifCount: 0,
   models: [
+    { id:'nvidia-z-ai-glm-5-1', label:'GLM 5.1 (NVIDIA)', censored:true, tags:['nvidia','thinking','code','default'] },
     { id:'llama-3.3-70b-versatile', label:'Llama 3.3 70B', censored:true, tags:[] },
     { id:'dolphin-mistral-24b-venice-hf', label:'Dolphin Mistral 24B Venice (HF)', censored:false, tags:['huggingface','featherless-ai','protected'] },
     { id:'dolphin-3.0-llama-3.1-8b', label:'Dolphin 3.0 Llama 3.1 8B (HF)', censored:false, tags:['huggingface','protected'] },
@@ -1848,6 +1849,7 @@ function selectModel(id) {
 // Cost-per-million-tokens estimates (input, output) in USD
 // Groq free-tier models are $0, HF/Ollama approximations included
 const MODEL_COST_PER_M = {
+  'nvidia-z-ai-glm-5-1':           [0.00, 0.00],
   'llama-3.3-70b-versatile':       [0.59, 0.79],
   'llama-3.1-8b-instant':          [0.05, 0.08],
   'dolphin-3.0-llama-3.1-8b':      [0.00, 0.00],
@@ -4762,7 +4764,7 @@ async function adminTab(tab, el) {
         </div>
       </div>`;
     } else if (tab === 'models') {
-      const d = await get('/admin/models');
+      const [d, roleData] = await Promise.all([get('/admin/models'), get('/admin/role-permissions')]);
       const models = d.models || [];
       window._adminModelRows = models;
       const enabledCount = models.filter(m => !!(m.access_enabled ?? m.is_active)).length;
@@ -4773,7 +4775,14 @@ async function adminTab(tab, el) {
         <button class="btn btn-ghost btn-sm" onclick="adminSeedModels()">Restore Defaults</button>
         <button class="btn btn-primary btn-sm" onclick="adminAddModelModal()">+ Add Model</button>
       </div>
-      ${renderAdminModelCompactList(models)}
+      ${renderAdminPlanModelMatrix(roleData)}
+      <div class="card" style="margin-top:14px;display:grid;gap:10px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:800">Global Model Registry</div>
+          <span class="badge badge-info">${enabledCount}/${models.length} global on</span>
+        </div>
+        ${renderAdminModelCompactList(models)}
+      </div>
       <div style="display:none"><table style="width:100%;border-collapse:collapse;min-width:1180px">
         <thead><tr style="font-size:10px;color:#4a4a6a;border-bottom:1px solid #1a1a30;text-transform:uppercase;letter-spacing:.08em">
           <th style="padding:8px;text-align:left;font-weight:700">Name</th>
@@ -5325,6 +5334,74 @@ function renderAdminRolePlan(plan) {
     </div>
   </div>`;
 }
+function renderAdminPlanModelMatrix(d = {}) {
+  const plansByKey = Object.fromEntries((d.plans || []).map(p => [String(p.plan || '').toLowerCase(), p]));
+  const allById = new Map();
+  (d.plans || []).forEach(plan => (plan.models || []).forEach(m => {
+    if (!m || !m.id) return;
+    const tags = (m.tags || []).map(t => String(t).toLowerCase());
+    const hay = `${m.id || ''} ${m.name || ''} ${m.model_name || ''} ${m.description || ''}`.toLowerCase();
+    if (tags.includes('internal') || tags.includes('image-to-text') || hay.includes('image-to-text')) return;
+    if (!allById.has(m.id)) allById.set(m.id, m);
+  }));
+  const models = [...allById.values()].sort((a,b) => {
+    const ad = a.id === DEFAULT_MODEL_ID ? -1 : 0;
+    const bd = b.id === DEFAULT_MODEL_ID ? -1 : 0;
+    if (ad !== bd) return ad - bd;
+    return String(a.provider || '').localeCompare(String(b.provider || '')) || String(a.name || a.id).localeCompare(String(b.name || b.id));
+  });
+  const defs = [
+    { key:'free', title:'FREE', hint:'HF models off', plans:['free'], accent:'#34d399' },
+    { key:'pro', title:'PRO', hint:'also applies to Premium', plans:['pro','premium'], accent:'#7c6ff7' },
+    { key:'enterprise', title:'ENTERPRISE', hint:'full control', plans:['enterprise'], accent:'#fbbf24' },
+  ];
+  const getPlanModel = (planKey, modelId) => (plansByKey[planKey]?.models || []).find(m => m.id === modelId);
+  const enabledForDef = (def, modelId) => def.plans.every(p => (getPlanModel(p, modelId)?.plan_enabled ?? true));
+  const rowHtml = (def, m) => {
+    const enabled = enabledForDef(def, m.id);
+    const provider = String(m.provider || '').toLowerCase();
+    const isHf = provider === 'huggingface';
+    const globalOn = !!(m.access_enabled ?? m.is_active);
+    const badgeCls = isHf ? 'badge-warn' : provider === 'nvidia' ? 'badge-ok' : 'badge-info';
+    return `<div style="border:1px solid ${enabled?'#26345d':'#17172c'};border-radius:10px;padding:10px;background:${enabled?'#0c1024':'#070711'};display:grid;gap:8px;min-width:0">
+      <div style="display:flex;gap:8px;align-items:flex-start;min-width:0">
+        <div style="flex:1;min-width:0">
+          <div style="font-weight:800;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(m.name || m.id)}</div>
+          <div style="font-family:'DM Mono',monospace;font-size:10px;color:#4a4a6a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(m.id)}</div>
+        </div>
+        <button class="btn ${enabled?'btn-danger':'btn-success'} btn-xs" onclick="adminSetPlanModelTier('${escAttr(def.key)}','${escAttr(m.id)}',${!enabled})">${enabled?'Off':'On'}</button>
+      </div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <span class="badge ${badgeCls}" style="font-size:9px">${escHtml(provider || 'model')}</span>
+        ${m.id === DEFAULT_MODEL_ID ? '<span class="badge badge-ok" style="font-size:9px">default</span>' : ''}
+        ${isHf ? '<span class="badge badge-warn" style="font-size:9px">paid tier</span>' : ''}
+        <span class="badge ${globalOn?'badge-ok':'badge-free'}" style="font-size:9px">${globalOn?'global on':'global off'}</span>
+      </div>
+    </div>`;
+  };
+  return `<div class="card" style="display:grid;gap:14px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:900">Plan Model Management</div>
+      <span class="badge badge-ok">GLM 5.1 NVIDIA default</span>
+      <span class="badge badge-warn">Hugging Face disabled for Free</span>
+      <span style="font-size:12px;color:#9090b0;margin-left:auto">${models.length} user-facing models</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(260px,1fr));gap:12px;overflow-x:auto">
+      ${defs.map(def => {
+        const enabledCount = models.filter(m => enabledForDef(def, m.id)).length;
+        return `<div style="border:1px solid #1a1a30;border-radius:12px;background:#080812;min-width:260px;display:grid;gap:10px;padding:12px;align-content:start">
+          <div style="display:flex;align-items:center;gap:8px">
+            <div style="width:9px;height:9px;border-radius:99px;background:${def.accent};box-shadow:0 0 16px ${def.accent}"></div>
+            <div style="font-family:'Syne',sans-serif;font-size:18px;font-weight:900">${def.title}</div>
+            <span class="badge badge-info" style="margin-left:auto">${enabledCount}/${models.length}</span>
+          </div>
+          <div style="font-size:11px;color:#9090b0">${def.hint}</div>
+          <div style="display:grid;gap:8px;max-height:520px;overflow:auto;padding-right:3px">${models.map(m => rowHtml(def, m)).join('')}</div>
+        </div>`;
+      }).join('')}
+    </div>
+  </div>`;
+}
 async function adminSetPlanFeature(plan, key, enabled) {
   try { await patch('/admin/role-permissions/'+encodeURIComponent(plan), { features:{ [key]:!!enabled } }); toast('Role feature updated','ok'); }
   catch(e) { toast(e.message,'err'); adminTab('roles', null); }
@@ -5332,6 +5409,14 @@ async function adminSetPlanFeature(plan, key, enabled) {
 async function adminSetPlanModel(plan, id, enabled) {
   try { await patch('/admin/role-permissions/'+encodeURIComponent(plan), { models:{ [id]:!!enabled } }); toast('Role model updated','ok'); }
   catch(e) { toast(e.message,'err'); adminTab('roles', null); }
+}
+async function adminSetPlanModelTier(tier, id, enabled) {
+  const plans = tier === 'pro' ? ['pro','premium'] : [tier];
+  try {
+    await Promise.all(plans.map(plan => patch('/admin/role-permissions/'+encodeURIComponent(plan), { models:{ [id]:!!enabled } })));
+    toast(`${tier.toUpperCase()} model access updated`, 'ok');
+    adminTab('models', null);
+  } catch(e) { toast(e.message,'err'); adminTab('models', null); }
 }
 function renderAdminModelUsage(d = {}) {
   const totals = d.totals || {};
