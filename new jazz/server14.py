@@ -608,6 +608,7 @@ NVIDIA_KIMI_PROVIDER_FALLBACKS = {
     ],
 }
 NVIDIA_STREAM_TIMEOUTS = {
+    "z-ai/glm-5.1": int(os.getenv("NVIDIA_GLM_51_TIMEOUT", "180")),
     "moonshotai/kimi-k2-instruct": int(os.getenv("NVIDIA_KIMI_INSTRUCT_TIMEOUT", "28")),
     "moonshotai/kimi-k2-instruct-0905": int(os.getenv("NVIDIA_KIMI_INSTRUCT_0905_TIMEOUT", "28")),
     "moonshotai/kimi-k2-thinking": int(os.getenv("NVIDIA_KIMI_THINKING_TIMEOUT", "12")),
@@ -2511,7 +2512,8 @@ async def _get_model_client(model_id: str) -> Tuple[OpenAI, str]:
         if row["provider"] == "minimax" and not api_key:
             api_key = MINIMAX_API_KEY
         if row["provider"] == "nvidia":
-            return OpenAI(api_key=api_key or "none", base_url=base_url, timeout=45.0), row["model_name"]
+            client_timeout = float(os.getenv("NVIDIA_GLM_51_TIMEOUT", "180") if row["model_name"] == "z-ai/glm-5.1" else "45")
+            return OpenAI(api_key=api_key or "none", base_url=base_url, timeout=client_timeout), row["model_name"]
         if row["provider"] == "minimax":
             return OpenAI(api_key=api_key or "none", base_url=base_url, timeout=60.0), row["model_name"]
         return OpenAI(api_key=api_key or "none", base_url=base_url), row["model_name"]
@@ -3035,7 +3037,8 @@ def _local_generate_system_context(last_user: str) -> str:
     lang = _local_detect_language(last_user)
     text = (
         "You are Jazz AI V1.0, a private from-scratch local LLM. "
-        "Answer the current user directly. Default to Hindi/Hinglish when unclear. "
+        "Answer the current user directly. Default to Roman Hindi/Hinglish when unclear. "
+        "Never use Devanagari for Hindi unless the user explicitly asks for Devanagari script. "
         "If the user clearly uses another language, reply in that same language. "
         "For dating or texting advice, be bold, playful, concise, and respectful. "
         "Use curiosity openers, light assumptions, question reframing, and imagination games. "
@@ -3043,7 +3046,7 @@ def _local_generate_system_context(last_user: str) -> str:
         "Do not repeat role labels."
     )
     if lang == "hi":
-        text += " Reply in natural Hindi/Hinglish."
+        text += " Reply in natural Roman Hindi/Hinglish, not Devanagari."
     return text
 
 def _messages_to_local_generate_prompt(messages: List[Dict]) -> str:
@@ -4218,6 +4221,8 @@ RESPONSE GUIDELINES:
 • For multi-file code, include a compact file tree and label each code block with its filename, for example `File: app.py` before a fenced code block.
 • When the user asks to create, generate, build, save, or make code, provide the actual file contents instead of only instructions."""
 
+_SYSTEM_PROMPT += "\n* If answering in Hindi, use Roman Hindi/Hinglish text only. Do not use Devanagari unless the user explicitly asks for Devanagari script."
+
 _ANTI_HALLUCINATION_PROMPT = """[Evidence and anti-hallucination rules]
 - Do not invent facts, names, files, document contents, web sources, tool results, prices, dates, or citations.
 - If the needed evidence is not in the current message, JAZZ memory, retrieved documents, attached files/images, web results, or tool output, say what is missing and ask for it.
@@ -4228,6 +4233,7 @@ _ANTI_HALLUCINATION_PROMPT = """[Evidence and anti-hallucination rules]
 
 _LOCAL_JAZZ_FAST_SYSTEM_PROMPT = (
     "You are Jazz AI, a direct assistant. Answer in the user's language. "
+    "If the answer would be in Hindi, write Roman Hindi/Hinglish only; do not use Devanagari unless explicitly requested. "
     "For greetings and simple questions, reply in one short natural answer. "
     "Use provided tool, web, image, or document context when it is present. "
     "Do not invent the user's name or facts. If evidence is missing, say so clearly. "
@@ -4503,7 +4509,8 @@ async def _build_context(session_id: str, user_id: str, new_msg: str,
                           web_results: Optional[List[Dict]] = None,
                           plan_mode: bool = False,
                           skill_context: str = "",
-                          mcp_context: str = "") -> List[Dict]:
+                          mcp_context: str = "",
+                          temporary_history: Optional[List[Dict[str, Any]]] = None) -> List[Dict]:
     local_fast = _is_local_jazz_model(model_id)
     budget = await _model_request_input_budget(model_id)
     sys_parts = (
@@ -4618,9 +4625,18 @@ async def _build_context(session_id: str, user_id: str, new_msg: str,
         budget -= _count_tokens(safe_new_msg)
 
     history_limit = 8 if local_fast else 60
-    history = await db_fetchall(
-        "SELECT role,content FROM chat_history WHERE session_id=? AND is_hidden=0 "
-        "ORDER BY created_at DESC LIMIT ?", (session_id, history_limit))
+    if temporary_history is not None:
+        history = []
+        for h in (temporary_history or [])[-history_limit:]:
+            role = str(h.get("role") or "").lower()
+            content = str(h.get("content") or "")
+            if role in {"user", "assistant"} and content.strip():
+                history.append({"role": role, "content": content[:20000]})
+        history.reverse()
+    else:
+        history = await db_fetchall(
+            "SELECT role,content FROM chat_history WHERE session_id=? AND is_hidden=0 "
+            "ORDER BY created_at DESC LIMIT ?", (session_id, history_limit))
     window = []
     for h in history:
         tok = _count_tokens(h["content"])
@@ -7349,6 +7365,16 @@ async def _infer_slash_command(message: str) -> Optional[Tuple[str, str]]:
     if not text or not _TOOL_INTENT_RE.search(text):
         return None
     low = text.lower()
+    if (
+        re.search(r"\b(draft|write|compose)\b.*\b(email|mail|cover\s+letter|letter)\b", low)
+        and not re.search(r"\b(use|via|with|through|in)\s+(gmail|outlook|mail)\b", low)
+    ):
+        return None
+    if (
+        re.search(r"\b(job|role|position|developer|analyst|resume|cv|cover\s+letter|application)\b", low)
+        and not re.search(r"\b(open|launch|use|run|call|list|show|search|find|connect|dataset|datasets|dashboard|dashboards|report|reports|workspace|workspaces)\b", low)
+    ):
+        return None
     rows = await db_fetchall(
         "SELECT command,connector_type FROM slash_commands WHERE is_active=1 ORDER BY LENGTH(command) DESC")
     platform = {
@@ -7898,6 +7924,8 @@ class ChatReq(BaseModel):
     attachments: List[Dict[str, Any]] = Field(default_factory=list)
     agent_mode: bool = False
     tools: Any = Field(default_factory=dict)
+    temporary: bool = False
+    temporary_history: List[Dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("skill_ids", mode="before")
     @classmethod
@@ -9273,6 +9301,52 @@ async def chat_message(req: ChatReq, background: BackgroundTasks, user: Dict = D
     background.add_task(_auto_extract_memories, uid, req.message, reply)
     background.add_task(_maybe_summarize, sid, uid, final_model_id)
     return {"message_id":mid,"content":reply,"session_id":sid,"latency_ms":elapsed,"context":context,"model_id":final_model_id,"model_label":await _model_display_name(final_model_id)}
+
+@app.post("/chat/temporary")
+async def chat_temporary(req: ChatReq, user: Dict = Depends(_get_current_user)):
+    await _check_rate_limit(user, "messages_per_day")
+    uid = user.get("id") or user.get("sub","")
+    requested_model_id = _canonical_model_id(req.model_id)
+    active_model_id, _ = await _auto_route_model(requested_model_id, req.message, uid)
+    t0 = time.time()
+    tool_opts = _chat_tool_options(req)
+    use_rag = bool(tool_opts.get("rag", req.use_rag))
+    use_web = bool(tool_opts.get("web_search", req.web_search))
+    plan_mode = bool(tool_opts.get("plan_mode", req.plan_mode))
+    skills, skill_matches = await _select_skills_for_message(req.message, tool_opts.get("skill_ids", req.skill_ids) or [])
+    web_results = await _web_search(req.message, 6) if use_web else None
+    tool_log: List[Dict[str, Any]] = [{"type":"tool_result","tool":"temporary_chat","label":"Temporary chat: not saved to history","count":1}]
+
+    identity_reply = await _identity_recall_reply(uid, req.message, user)
+    if identity_reply:
+        elapsed = int((time.time()-t0)*1000)
+        context = {"session_id": None, "percent_used": 0, "percent_left": 100, "used_tokens": 0,
+                   "context_limit_tokens": await _model_context_limit(active_model_id),
+                   "summary_count": 0, "hidden_messages": 0, "auto_compact_threshold_percent": 90}
+        return {"message_id":_new_id(),"content":identity_reply,"session_id":None,"temporary":True,
+                "latency_ms":elapsed,"tokens":{"input":_count_tokens(req.message),"output":_count_tokens(identity_reply)},
+                "context":context,"model_id":active_model_id,"model_label":await _model_display_name(active_model_id),
+                "tool_events":tool_log}
+
+    effective_message, _ = await _build_image_context(req, uid, active_model_id, tool_log)
+    messages = await _build_context("__temporary__", uid, effective_message, use_rag, active_model_id,
+                                    web_results, plan_mode, _format_skill_context(skills),
+                                    _format_mcp_context(tool_opts.get("mcp_tools", [])),
+                                    temporary_history=req.temporary_history or [])
+    llm_result = await _llm_text_with_fallback(messages, active_model_id, max_tokens=4096, user_id=uid)
+    reply = llm_result.get("content", "")
+    final_model_id = llm_result.get("model_id") or active_model_id
+    tool_log = tool_log + [{"type":"skill_loaded","skill_id":s["id"],"name":s["name"],"matched_by":skill_matches[i] if i < len(skill_matches) else ""} for i,s in enumerate(skills)]
+    tool_log.extend(llm_result.get("events", []))
+    elapsed = int((time.time()-t0)*1000)
+    tok_in = sum(_count_tokens(m.get("content","") if isinstance(m.get("content"), str) else "") for m in messages)
+    context = {"session_id": None, "percent_used": 0, "percent_left": 100, "used_tokens": tok_in + _count_tokens(reply),
+               "context_limit_tokens": await _model_context_limit(final_model_id),
+               "summary_count": 0, "hidden_messages": 0, "auto_compact_threshold_percent": 90}
+    return {"message_id":_new_id(),"content":reply,"session_id":None,"temporary":True,
+            "latency_ms":elapsed,"tokens":{"input":tok_in,"output":_count_tokens(reply)},
+            "context":context,"model_id":final_model_id,"model_label":await _model_display_name(final_model_id),
+            "tool_events":tool_log}
 
 @app.post("/chat/messages/{mid}/feedback")
 async def message_feedback(mid: str, body: dict, user: Dict = Depends(_get_current_user)):

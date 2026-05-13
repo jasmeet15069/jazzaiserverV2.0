@@ -91,7 +91,7 @@ body:not(.light) #hljs-theme-light{display:none}
 .msg-user pre{white-space:pre-wrap;overflow:auto;max-height:42svh;margin:8px 0 0;font-family:'DM Mono',monospace;font-size:12px;line-height:1.55;color:#e4e4f4}
 .msg-user.long-input{max-width:min(860px,88%);width:auto}
 .msg-user img{max-width:100%;border-radius:8px;margin-top:6px;border:1px solid #1a1a30;display:block}
-.msg-ai{font-size:14px;line-height:1.7;max-width:100%;word-break:break-word}
+.msg-ai{font-size:14px;line-height:1.75;max-width:100%;word-break:break-word;font-family:'Outfit',system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-weight:400;letter-spacing:.01em}
 .msg-ai pre{background:#0c0c1a;border:1px solid #1a1a30;border-radius:8px;overflow-x:auto;margin:10px 0;position:relative}
 .msg-ai pre code{font-family:'DM Mono',monospace;font-size:12.5px;padding:16px;display:block}
 .msg-ai code:not(pre code){background:#131328;border:1px solid #1a1a30;padding:2px 6px;border-radius:4px;font-size:12.5px;font-family:'DM Mono',monospace}
@@ -102,6 +102,14 @@ body:not(.light) #hljs-theme-light{display:none}
 .msg-ai th{background:#111124}
 .msg-ai blockquote{border-left:2px solid #7c6ff7;padding-left:12px;color:#9090b0;margin:8px 0}
 .msg-ai h1,.msg-ai h2,.msg-ai h3{font-family:'Syne',sans-serif;margin:12px 0 6px;font-weight:600}
+.reply-preview,.reply-inline{border:1px solid rgba(124,111,247,.32);border-left:3px solid #7c6ff7;background:rgba(124,111,247,.08);border-radius:10px;padding:8px 10px;color:#c7c7e8;font-size:12px;line-height:1.45}
+.reply-preview{display:flex;align-items:flex-start;gap:9px}
+.reply-preview .reply-body,.reply-inline .reply-body{min-width:0;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.reply-label{font-family:'DM Mono',monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#9d93fa;margin-bottom:2px}
+.reply-close{margin-left:auto;background:transparent;border:none;color:#9090b0;cursor:pointer;font-size:15px;line-height:1;padding:2px 4px}
+.reply-close:hover{color:#fff}
+.session-item.temporary-chat{border-color:#7c6ff7;background:#111126}
+.session-item.temporary-chat .temp-tag{font-family:'DM Mono',monospace;font-size:10px;color:#34d399}
 .msg-empty{display:inline-flex;align-items:center;gap:8px;background:#1f0a0a;border:1px solid #7f1d1d;color:#fca5a5;border-radius:8px;padding:9px 12px;font-size:13px}
 .msg-tool{background:#0a0f1a;border:1px solid #1e3a5f;border-radius:10px;padding:10px 14px;font-size:13px;margin:4px 0}
 .msg-tool .tool-header{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12px;color:#60a5fa;font-family:'DM Mono',monospace}
@@ -608,6 +616,8 @@ body.light .msg-user{background:#eef1ff!important;border-color:#d7dcf3!important
 body.light .msg-user summary,
 body.light .msg-user pre{color:#181827}
 body.light .msg-ai{color:#1f2333}
+body.light .reply-preview,
+body.light .reply-inline{background:#f1efff!important;border-color:#ddd6fe!important;border-left-color:var(--accent)!important;color:#34324d!important}
 body.light .msg-ai pre,
 body.light .msg-ai code:not(pre code){background:#f6f7fb!important;border-color:#d9deef!important;color:#1f2333!important}
 body.light .msg-ai th{background:#eef1ff!important}
@@ -726,6 +736,7 @@ try {
     <div class="sidebar-middle">
       <nav style="padding:10px 8px;flex-shrink:0">
         <button class="nav-item sidebar-new-chat" type="button" onclick="newSession()"><span class="icon">+</span>New Chat</button>
+        <button class="nav-item" type="button" onclick="startTemporaryChat()" title="Temporary chat is not saved"><span class="icon">~</span>Temporary Chat</button>
         <a class="nav-item" data-page="chat"        onclick="navigate('chat')">       <span class="icon">💬</span>Chat</a>
         <a class="nav-item" data-page="agents"      data-feature-key="agents" onclick="navigate('agents')">     <span class="icon">🤖</span>Agent Jobs</a>
         <a class="nav-item" data-page="playground"  data-feature-key="playground" onclick="navigate('playground')"> <span class="icon">⚡</span>Playground</a>
@@ -742,6 +753,7 @@ try {
           <div style="display:flex;gap:6px;align-items:center">
             <button class="btn btn-sm btn-ghost" onclick="toggleChatSearch()" title="Search chats" aria-label="Search chats" style="width:34px;height:32px;padding:0;justify-content:center;font-size:14px">⌕</button>
             <button class="btn btn-sm btn-primary" onclick="newSession()" style="padding:4px 10px;font-size:11px">+ New</button>
+            <button class="btn btn-sm btn-ghost" onclick="startTemporaryChat()" title="Temporary chat" style="padding:4px 9px;font-size:11px">Temp</button>
           </div>
         </div>
         <div id="session-search-wrap" style="display:none;padding:0 10px 8px;flex-shrink:0">
@@ -1014,7 +1026,7 @@ function mergeLocalSidebarFeatures(rows = []) {
 const S = {
   user: null, token: null, refresh: null,
   page: 'chat', sessions: [], activeSession: null,
-  messages: [], streaming: false, forceFreshChat: false,
+  messages: [], streaming: false, forceFreshChat: false, temporaryChat: false, replyDraft: null,
   modelId: DEFAULT_MODEL_ID, useRag: true, useWeb: true, planMode: false, agentMode: false,
   notifications: [], notifCount: 0,
   models: [
@@ -1393,6 +1405,7 @@ async function loadModels({ preserveSelection = true } = {}) {
           S.modelHealth[m.id] = { status:'ok', reason:'available', ts:Date.now() };
         }
       });
+      ensureSelectedModelAvailable();
     }
   } catch(e) {}
 }
@@ -1610,6 +1623,7 @@ async function chat({ sessionId } = {}) {
         <div id="model-retry-bar" class="model-retry-bar"></div>
 
         <div id="attach-tray" class="attach-tray"></div>
+        <div id="reply-preview" style="display:none"></div>
 
         <!-- Image preview -->
         <div id="img-preview-bar">
@@ -1666,7 +1680,14 @@ async function chat({ sessionId } = {}) {
   updateToolsCount();
   updateFilesBadge();
   await loadSessions();
-  if (sessionId) { S.forceFreshChat = false; loadSession(sessionId); }
+  renderReplyDraft();
+  if (S.temporaryChat) {
+    S.activeSession = null; S.messages = []; renderSessionList(); renderMessages([]);
+    const t = document.getElementById('chat-title'); if (t) t.textContent = 'Temporary Chat';
+    const meta = document.getElementById('chat-meta'); if (meta) meta.textContent = 'Not saved - clears on reload or switching chats';
+    updateContextMeter({ percent_used:0, percent_left:100, used_tokens:0, context_limit_tokens:(S.models.find(m=>m.id===S.modelId)?.ctx||32768), summary_count:0, hidden_messages:0, auto_compact_threshold_percent:90 });
+  }
+  else if (sessionId) { S.forceFreshChat = false; loadSession(sessionId); }
   else if (S.forceFreshChat) {
     S.forceFreshChat = false;
     S.activeSession = null; S.messages = []; renderSessionList(); renderMessages([]);
@@ -1739,6 +1760,7 @@ function modelHealth(id) {
 function setModelHealth(id, status = 'ok', reason = '') {
   if (!id) return;
   S.modelHealth[id] = { status, reason: reason || (status === 'bad' ? 'failed' : 'available'), ts:Date.now() };
+  if (status === 'bad' && id === S.modelId) ensureSelectedModelAvailable();
   updateModelPill();
   if (_dropOpen) rerenderModelDropdown();
 }
@@ -1747,9 +1769,24 @@ function modelStatusDotHtml(id) {
   const cls = h.status === 'bad' ? 'bad' : h.status === 'checking' ? 'checking' : '';
   return `<span class="model-status-dot ${cls}" title="${escAttr(h.reason || h.status)}"></span>`;
 }
+function visibleModelOptions() {
+  const models = S.models || [];
+  const visible = models.filter(m => modelHealth(m.id).status !== 'bad');
+  return visible.length ? visible : models;
+}
+function ensureSelectedModelAvailable({ persist = true } = {}) {
+  const models = visibleModelOptions();
+  if (!models.length) return null;
+  const selected = models.find(m => m.id === S.modelId) || models[0];
+  if (selected && selected.id !== S.modelId) {
+    S.modelId = selected.id;
+    if (persist) localStorage.setItem('jazz_model_id', selected.id);
+  }
+  return selected;
+}
 function getNextWorkingModel(excludeId = S.modelId) {
-  const candidates = (S.models || []).filter(m => m.id !== excludeId);
-  return candidates.find(m => modelHealth(m.id).status !== 'bad') || candidates[0] || null;
+  const candidates = visibleModelOptions().filter(m => m.id !== excludeId);
+  return candidates[0] || visibleModelOptions()[0] || null;
 }
 function showModelRetryBar(reason = '') {
   const bar = document.getElementById('model-retry-bar');
@@ -1773,7 +1810,7 @@ function continueWithNextModel() {
   const retry = S.lastFailedChat;
   S.lastFailedChat = null;
   toast(`Continuing with ${next.label}`, 'info');
-  if (retry?.msg) _executeChat(retry.msg, retry.attachments || []);
+  if (retry?.msg) _executeChat(retry.msg, retry.attachments || [], retry.replyDraft || null);
 }
 async function refreshModelHealthBackground() {
   const before = new Set((S.models || []).map(m => m.id));
@@ -1788,7 +1825,7 @@ function startModelHealthChecks() {
   S.modelHealthTimer = setInterval(refreshModelHealthBackground, 60000);
 }
 function updateModelPill() {
-  const m = S.models.find(x => x.id === S.modelId) || S.models[0];
+  const m = ensureSelectedModelAvailable({ persist:false }) || S.models.find(x => x.id === S.modelId) || S.models[0];
   if (!m) return;
   const dot = document.getElementById('model-dot');
   const lbl = document.getElementById('model-pill-label');
@@ -1815,14 +1852,15 @@ function toggleModelDropdown(e) {
   setTimeout(() => document.addEventListener('click', _closeDrop), 0);
 }
 function renderModelDropdownHtml() {
+  const visible = visibleModelOptions();
   return `<div class="model-dropdown" onclick="event.stopPropagation()">
     <div style="padding:8px 12px 4px;font-size:10px;color:#4a4a6a;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border-bottom:1px solid #1a1a30;margin-bottom:4px">Select Model</div>
-    ${S.models.map(m => `
+    ${visible.length ? visible.map(m => `
       <div class="model-opt${m.id===S.modelId?' selected':''}" onclick="selectModel(${escAttr(JSON.stringify(String(m.id)))})">
         ${modelStatusDotHtml(m.id)}
         <span style="flex:1;font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(m.label)}</span>
         <span class="badge ${m.censored?'badge-free':'badge badge-warn'}" style="font-size:10px">${m.censored?'safe':'uncensored'}</span>
-      </div>`).join('')}
+      </div>`).join('') : `<div style="padding:10px 12px;font-size:12px;color:#9090b0">No healthy models available right now.</div>`}
   </div>`;
 }
 function rerenderModelDropdown() {
@@ -2029,6 +2067,13 @@ function clearChatSearch() {
 }
 function renderSessionList() {
   const el = document.getElementById('session-list'); if (!el) return;
+  const tempItem = S.temporaryChat ? `<div class="session-item temporary-chat active" onclick="startTemporaryChat()" data-sid="temporary">
+    <div style="display:flex;align-items:center;gap:6px">
+      <span class="temp-tag">TEMP</span>
+      <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px">Temporary Chat</span>
+    </div>
+    <div style="font-size:10px;color:#4a4a6a;margin-top:3px">Clears on reload or switching chats</div>
+  </div>` : '';
   const searching = !!S.chatSearchQuery.trim();
   if (searching) {
     if (S.chatSearchLoading) {
@@ -2054,7 +2099,7 @@ function renderSessionList() {
       </div>`).join('')}`;
     return;
   }
-  if (!S.sessions.length) { el.innerHTML = `<div style="font-size:12px;color:#4a4a6a;text-align:center;padding:20px">No sessions yet</div>`; return; }
+  if (!S.sessions.length) { el.innerHTML = tempItem || `<div style="font-size:12px;color:#4a4a6a;text-align:center;padding:20px">No sessions yet</div>`; return; }
   const groups = { Today:[], Yesterday:[], 'This Week':[], Older:[] };
   const now = new Date(), today = now.toDateString(), yday = new Date(now - 86400000).toDateString();
   S.sessions.forEach(s => {
@@ -2064,7 +2109,7 @@ function renderSessionList() {
     else if (now - d < 7*86400000) groups['This Week'].push(s);
     else groups.Older.push(s);
   });
-  el.innerHTML = Object.entries(groups).filter(([, v]) => v.length).map(([g, ss]) => `
+  el.innerHTML = tempItem + Object.entries(groups).filter(([, v]) => v.length).map(([g, ss]) => `
     <div style="font-size:10px;color:#4a4a6a;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:8px 6px 4px">${g}</div>
     ${ss.map(s => `<div class="session-item${S.activeSession===s.id?' active':''}" onclick="loadSession('${s.id}')" data-sid="${s.id}">
       <div style="display:flex;align-items:center;gap:4px">
@@ -2084,6 +2129,7 @@ function renderSessionList() {
   `).join('');
 }
 async function loadSession(id) {
+  S.temporaryChat = false; S.replyDraft = null; renderReplyDraft();
   S.activeSession = id; renderSessionList();
   try {
     const d = await get(`/sessions/${id}/messages?limit=80`);
@@ -2119,14 +2165,16 @@ function renderToolTimeline(events = []) {
 function parseToolEvents(raw) {
   try { const v = typeof raw === 'string' ? JSON.parse(raw || '[]') : raw; return Array.isArray(v) ? v : []; } catch(e) { return []; }
 }
-function renderUserContent(text, extraHtml = '') {
+function renderUserContent(text, extraHtml = '', replyDraft = null) {
   const raw = String(text ?? '');
+  const replyHtml = renderReplyInline(replyDraft);
   const isLong = raw.length > 1800 || raw.split(/\r?\n/).length > 24;
-  if (!isLong) return `<div class="msg-user">${escHtml(raw)}${extraHtml}</div>`;
+  if (!isLong) return `<div class="msg-user">${replyHtml}${replyHtml ? '<div style="height:8px"></div>' : ''}${escHtml(raw)}${extraHtml}</div>`;
   const chars = raw.length.toLocaleString();
   const lines = raw.split(/\r?\n/).length.toLocaleString();
   const preview = raw.slice(0, 420).replace(/\s+$/,'');
   return `<div class="msg-user long-input">
+    ${replyHtml}
     <details>
       <summary>Long input · ${chars} chars · ${lines} lines</summary>
       <div style="font-size:12px;color:#9090b0;margin-top:6px">${escHtml(preview)}${raw.length > 420 ? '…' : ''}</div>
@@ -2163,6 +2211,7 @@ function renderMessages(msgs, summaries = []) {
           <span style="font-size:10px;color:#4a4a6a;font-family:'DM Mono',monospace">${tokInfo}</span>
           ${m.mode==='thinking'?'<span class="badge badge-tool" style="font-size:9px">🧠 thinking</span>':''}
           <button onclick="copyMsg(this)" data-text="${escAttr((() => { const _p = tryParseToolPayload(m.content); if (!_p) return m.content; const _r = _p.result; const _it = Array.isArray(_r) ? _r : Array.isArray(_r?.results) ? _r.results : Array.isArray(_r?.messages) ? _r.messages : (_r ? [_r] : []); return `[${_p.app}/${_p.action}] ${_it.length} result(s)\n`+_it.slice(0,10).map((r,i)=>r&&typeof r==='object'?`${i+1}. ${r.subject||r.title||r.name||r.id||JSON.stringify(r)}`:String(r)).join('\n'); })())}" class="btn btn-ghost btn-xs">copy</button>
+          <button onclick="replyToMessage('assistant', this.dataset.text, '${m.id||''}')" data-text="${escAttr(m.content||'')}" class="btn btn-ghost btn-xs">reply</button>
           <button onclick="regenMsg('${m.id}')" class="btn btn-ghost btn-xs">↺ regen</button>
           <button onclick="ttsMsg('${escAttr(m.content.slice(0,500))}')" class="btn btn-ghost btn-xs">🔊</button>
           <button onclick="feedbackMsg('${m.id}',1)"  class="btn btn-ghost btn-xs">👍</button>
@@ -2439,15 +2488,67 @@ function addCopyBtns() {
   });
 }
 function scrollBottom() { const el = document.getElementById('messages'); if (el) el.scrollTop = el.scrollHeight; }
+function freshContextStatus() {
+  return { percent_used:0, percent_left:100, used_tokens:0, context_limit_tokens:(S.models.find(m=>m.id===S.modelId)?.ctx||32768), summary_count:0, hidden_messages:0, auto_compact_threshold_percent:90 };
+}
+function setChatHeader(title = 'New Chat', meta = 'Fresh chat') {
+  const t = document.getElementById('chat-title'); if (t) t.textContent = title;
+  const m = document.getElementById('chat-meta'); if (m) m.textContent = meta;
+}
+function temporaryHistoryForApi() {
+  return (S.messages || [])
+    .filter(m => ['user','assistant'].includes(m.role) && String(m.content || '').trim())
+    .slice(-16)
+    .map(m => ({ role:m.role, content:String(m.content || '').slice(0, 20000) }));
+}
+function replyExcerpt(text, max = 220) {
+  return String(text || '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+function renderReplyInline(draft) {
+  if (!draft) return '';
+  return `<div class="reply-inline"><div class="reply-label">Replying to ${escHtml(draft.role || 'message')}</div><div class="reply-body">${escHtml(replyExcerpt(draft.content, 260))}</div></div>`;
+}
+function renderReplyDraft() {
+  const el = document.getElementById('reply-preview');
+  if (!el) return;
+  if (!S.replyDraft) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = 'block';
+  el.innerHTML = `<div class="reply-preview"><div style="min-width:0;flex:1"><div class="reply-label">Replying to ${escHtml(S.replyDraft.role || 'message')}</div><div class="reply-body">${escHtml(replyExcerpt(S.replyDraft.content))}</div></div><button class="reply-close" onclick="clearReplyDraft()" title="Cancel reply">x</button></div>`;
+}
+function clearReplyDraft() { S.replyDraft = null; renderReplyDraft(); }
+function replyToMessage(role, content, id = '') {
+  S.replyDraft = { role: role || 'message', content: String(content || ''), id };
+  renderReplyDraft();
+  const inp = document.getElementById('chat-input');
+  if (inp) setTimeout(() => inp.focus(), 0);
+}
+function buildReplyPrefix(draft) {
+  if (!draft) return '';
+  return `[Replying to ${draft.role || 'message'}]\n> ${replyExcerpt(draft.content, 600)}\n\n`;
+}
 async function newSession() {
+  S.temporaryChat = false; S.replyDraft = null; renderReplyDraft();
   S.forceFreshChat = true;
   if (S.page !== 'chat' || !document.getElementById('messages')) { navigate('chat'); return; }
   S.activeSession = null; S.messages = []; S.chatQueue = []; S.queueRunning = false;
   clearChatSearch();
   renderSessionList(); renderMessages([]); renderQueuePanel();
-  updateContextMeter({ percent_used:0, percent_left:100, used_tokens:0, context_limit_tokens:(S.models.find(m=>m.id===S.modelId)?.ctx||32768), summary_count:0, hidden_messages:0, auto_compact_threshold_percent:90 });
-  const t = document.getElementById('chat-title'); if (t) t.textContent = 'New Chat';
-  const meta = document.getElementById('chat-meta'); if (meta) meta.textContent = 'Fresh chat';
+  updateContextMeter(freshContextStatus());
+  setChatHeader('New Chat', 'Fresh chat');
+  const input = document.getElementById('chat-input'); if (input) setTimeout(() => input.focus(), 0);
+  closeSidebar();
+}
+async function startTemporaryChat() {
+  S.forceFreshChat = false;
+  S.temporaryChat = true;
+  S.replyDraft = null;
+  renderReplyDraft();
+  if (S.page !== 'chat' || !document.getElementById('messages')) { navigate('chat'); return; }
+  S.activeSession = null; S.messages = []; S.chatQueue = []; S.queueRunning = false;
+  clearChatSearch();
+  renderSessionList(); renderMessages([]); renderQueuePanel();
+  updateContextMeter(freshContextStatus());
+  setChatHeader('Temporary Chat', 'Not saved - clears on reload or switching chats');
   const input = document.getElementById('chat-input'); if (input) setTimeout(() => input.focus(), 0);
   closeSidebar();
 }
@@ -2645,9 +2746,11 @@ function isToolSlashMessage(text) {
 function submitChat() {
   const inp = document.getElementById('chat-input');
   const attachments = [...(S.pendingAttachments || [])];
+  const replyDraft = S.replyDraft;
   let msg = inp.value.trim();
   if (!msg && !attachments.length) return;
   if (!msg) msg = 'Please analyze the attached file(s).';
+  S.replyDraft = null; renderReplyDraft();
   inp.value = ''; inp.style.height = 'auto';
   document.getElementById('slash-palette').style.display = 'none';
   S.pendingAttachments = [];
@@ -2657,44 +2760,47 @@ function submitChat() {
   if (S.filesPanelOpen) renderFilesPanel();
   const bar = document.getElementById('img-preview-bar'); if (bar) bar.style.display = 'none';
   if (S.streaming) {
-    S.chatQueue.push({ id: 'q_'+Date.now()+'_'+Math.random().toString(36).slice(2), msg, attachments });
+    S.chatQueue.push({ id: 'q_'+Date.now()+'_'+Math.random().toString(36).slice(2), msg, attachments, replyDraft });
     renderQueuePanel(); toast(`Queued (#${S.chatQueue.length})`, 'info'); return;
   }
-  _executeChat(msg, attachments);
+  _executeChat(msg, attachments, replyDraft);
 }
-function _executeChat(msg, attachments = []) { S.streaming = true; renderQueuePanel(); _sendChatInternal(msg, attachments); }
+function _executeChat(msg, attachments = [], replyDraft = null) { S.streaming = true; renderQueuePanel(); _sendChatInternal(msg, attachments, replyDraft); }
 function _tryRunNextQueued() {
   if (!S.chatQueue.length) { S.streaming = false; renderQueuePanel(); return; }
-  const next = S.chatQueue.shift(); renderQueuePanel(); _executeChat(next.msg, next.attachments || []);
+  const next = S.chatQueue.shift(); renderQueuePanel(); _executeChat(next.msg, next.attachments || [], next.replyDraft || null);
 }
 
-async function _sendChatInternal(msg, attachments = []) {
+async function _sendChatInternal(msg, attachments = [], replyDraft = null) {
   const msgsEl = document.getElementById('messages');
   if (!msgsEl) { S.streaming = false; _tryRunNextQueued(); return; }
   const empty = msgsEl.querySelector('div[style*="align-items:center"]');
   if (empty) msgsEl.innerHTML = '';
 
   const localAttachments = attachments || [];
+  const localReplyDraft = replyDraft || null;
+  const tempHistory = S.temporaryChat ? temporaryHistoryForApi() : [];
   const requestedModelId = S.modelId;
   let activeModelId = requestedModelId;
   let requestCompleted = false;
   hideModelRetryBar();
   setModelHealth(requestedModelId, 'checking', 'checking response');
   const attachHtml = renderAttachmentCards(localAttachments, false);
-  msgsEl.insertAdjacentHTML('beforeend', `<div style="display:flex;justify-content:flex-end" class="fade-in">${renderUserContent(msg, attachHtml)}</div>`);
+  msgsEl.insertAdjacentHTML('beforeend', `<div style="display:flex;justify-content:flex-end" class="fade-in">${renderUserContent(msg, attachHtml, localReplyDraft)}</div>`);
+  if (S.temporaryChat) S.messages.push({ role:'user', content:(buildReplyPrefix(localReplyDraft) + msg).trim(), created_at:new Date().toISOString() });
 
   const aiId = 'ai-' + Date.now();
   msgsEl.insertAdjacentHTML('beforeend', `<div class="fade-in" id="${aiId}"><div class="tool-timeline" id="${aiId}-tools"></div><div class="msg-ai cursor-blink" style="min-height:20px"></div></div>`);
   scrollBottom();
   document.getElementById('typing-ind').style.display = 'block';
 
-  let apiMsg = msg;
+  let apiMsg = (buildReplyPrefix(localReplyDraft) + msg).trim();
   let imgData = null;
   if (localAttachments.length) {
     const preparedAttachments = await prepareAttachmentsForSend(localAttachments);
     addFilesToLibrary(preparedAttachments);
     const attachmentContext = buildAttachmentContext(preparedAttachments);
-    if (attachmentContext) apiMsg = `${msg}\n\n${attachmentContext}`;
+    if (attachmentContext) apiMsg = `${apiMsg}\n\n${attachmentContext}`;
     const firstImage = preparedAttachments.find(att => isImageFile(att) && att.dataUrl);
     if (firstImage) imgData = firstImage.dataUrl;
   }
@@ -2711,13 +2817,13 @@ async function _sendChatInternal(msg, attachments = []) {
     if (d?.model_id) {
       activeModelId = d.model_id;
       updateModelPill();
-      loadContextStatus();
+      if (!S.temporaryChat) loadContextStatus();
     }
     if (!full.trim() && d?.content) full = String(d.content);
     const noModelText = !full.trim();
     if (noModelText) {
       setModelHealth(activeModelId, 'bad', 'no text returned');
-      S.lastFailedChat = { msg, attachments: localAttachments };
+      S.lastFailedChat = { msg, attachments: localAttachments, replyDraft: localReplyDraft };
       showModelRetryBar('No response from this model.');
       full = 'I did not receive text from the selected model on that attempt.';
     } else {
@@ -2743,11 +2849,19 @@ async function _sendChatInternal(msg, attachments = []) {
         <span style="font-size:10px;color:#4a4a6a;font-family:'DM Mono',monospace">${d.latency_ms||0}ms · ↑${d.tokens?.input||0} ↓${d.tokens?.output||0}</span>
         ${mode==='thinking'?'<span class="badge badge-tool" style="font-size:9px">🧠 thinking</span>':''}
         <button onclick="copyMsg(this)" data-text="${escAttr(displayText)}" class="btn btn-ghost btn-xs">copy</button>
+        <button onclick="replyToMessage('assistant', this.dataset.text)" data-text="${escAttr(full)}" class="btn btn-ghost btn-xs">reply</button>
       </div>`);
     addCopyBtns(); hljs.highlightAll(); scrollBottom();
     updateTokenBar({ input:d.tokens?.input||0, output:d.tokens?.output||0, context:d.context });
-    if (!d.context) setTimeout(loadContextStatus, 300);
-    loadSessions(); loadUsage(); renderQueuePanel(); _tryRunNextQueued();
+    if (!d.context && !S.temporaryChat) setTimeout(loadContextStatus, 300);
+    if (S.temporaryChat) {
+      S.activeSession = null;
+      S.messages.push({ role:'assistant', content:full, model_used:activeModelId, created_at:new Date().toISOString() });
+      renderSessionList();
+    } else {
+      loadSessions();
+    }
+    loadUsage(); renderQueuePanel(); _tryRunNextQueued();
   }
   function _onDelta(content) {
     full += content;
@@ -2796,7 +2910,7 @@ async function _sendChatInternal(msg, attachments = []) {
     document.getElementById('typing-ind').style.display = 'none';
     const err = errText(errMsg);
     setModelHealth(activeModelId, 'bad', err || 'stream error');
-    S.lastFailedChat = { msg, attachments: localAttachments };
+    S.lastFailedChat = { msg, attachments: localAttachments, replyDraft: localReplyDraft };
     showModelRetryBar('This model failed. Try the next working model.');
     const bubble = document.querySelector(`#${aiId} .msg-ai`);
     if (bubble) bubble.style.display = '';
@@ -2853,7 +2967,35 @@ async function _sendChatInternal(msg, attachments = []) {
     } catch(err) { _onError(err.message); }
   }
 
+  async function _tryTemporaryChat() {
+    if (!S.temporaryChat) return false;
+    try {
+      const body = {
+        message: apiMsg,
+        model_id: requestedModelId,
+        use_rag: S.useRag,
+        web_search: S.useWeb,
+        plan_mode: S.planMode,
+        agent_mode: S.agentMode,
+        tools: selectedToolOptions(),
+        skill_ids: S.selectedSkillIds || [],
+        image_url: imgData || undefined,
+        temporary: true,
+        temporary_history: tempHistory
+      };
+      const d = await post('/chat/temporary', body);
+      (d.tool_events || []).forEach(_onToolEvent);
+      full = d.content || '';
+      _onDone({ ...d, content: full, session_id:null, temporary:true });
+      return true;
+    } catch(err) {
+      _onError(err.message);
+      return true;
+    }
+  }
+
   try {
+    if (await _tryTemporaryChat()) return;
     const preferPost = apiMsg.length > 1800 || !!imgData || localAttachments.length || S.agentMode;
     const esWorked = preferPost ? false : await _tryEventSource();
     if (!esWorked) await _tryPostStream();
